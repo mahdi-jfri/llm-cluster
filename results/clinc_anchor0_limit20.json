@@ -1,0 +1,152 @@
+{
+  "dataset": {
+    "split": "test",
+    "config": "plus",
+    "n_loaded_rows": 4500,
+    "n_ranked_candidates": 20,
+    "oos_removed": true,
+    "candidate_seed": 0,
+    "sort_seed": 0
+  },
+  "model": {
+    "provider": "openrouter",
+    "model_name": "qwen/qwen3.5-9b"
+  },
+  "anchor": {
+    "id": "0",
+    "text": "how would you say fly in italian",
+    "label": 61,
+    "label_name": "translate"
+  },
+  "metrics": {
+    "n_items": 20,
+    "n_in_cluster": 0,
+    "n_out_cluster": 20,
+    "inversions": 0,
+    "max_inversions": 0,
+    "inversion_rate": 0.0,
+    "in_cluster_auc": 1.0
+  },
+  "ranked_rows": [
+    {
+      "id": "1995",
+      "text": "ai roll the dice",
+      "label": 92,
+      "label_name": "roll_dice"
+    },
+    {
+      "id": "2271",
+      "text": "switch voice option to female",
+      "label": 51,
+      "label_name": "change_accent"
+    },
+    {
+      "id": "307",
+      "text": "tell me fun facts of today",
+      "label": 129,
+      "label_name": "fun_fact"
+    },
+    {
+      "id": "223",
+      "text": "will i be safe going to south america",
+      "label": 128,
+      "label_name": "travel_alert"
+    },
+    {
+      "id": "230",
+      "text": "find travel alerts for haiti",
+      "label": 128,
+      "label_name": "travel_alert"
+    },
+    {
+      "id": "4102",
+      "text": "help me add this song to my country music playlist",
+      "label": 141,
+      "label_name": "update_playlist"
+    },
+    {
+      "id": "4114",
+      "text": "i need you to cancel my reservation for 5 at red robin",
+      "label": 67,
+      "label_name": "cancel_reservation"
+    },
+    {
+      "id": "1692",
+      "text": "have i gotten around to adding the bike ride to my calendar yet",
+      "label": 60,
+      "label_name": "calendar"
+    },
+    {
+      "id": "4483",
+      "text": "do you know why my card got declined",
+      "label": 49,
+      "label_name": "card_declined"
+    },
+    {
+      "id": "3133",
+      "text": "i need to know how many pounds are in 10 kilos",
+      "label": 31,
+      "label_name": "measurement_conversion"
+    },
+    {
+      "id": "3056",
+      "text": "tell me when today's meeting is supposed to happen",
+      "label": 19,
+      "label_name": "meeting_schedule"
+    },
+    {
+      "id": "385",
+      "text": "when will my payment be deposited",
+      "label": 79,
+      "label_name": "payday"
+    },
+    {
+      "id": "4433",
+      "text": "is there traffic expected",
+      "label": 24,
+      "label_name": "traffic"
+    },
+    {
+      "id": "4499",
+      "text": "why didn't my card work",
+      "label": 49,
+      "label_name": "card_declined"
+    },
+    {
+      "id": "1815",
+      "text": "how many carry ons can i take on a flight with delta to seattle",
+      "label": 62,
+      "label_name": "carry_on"
+    },
+    {
+      "id": "241",
+      "text": "how does one go about putting in a vacation request",
+      "label": 97,
+      "label_name": "pto_request"
+    },
+    {
+      "id": "467",
+      "text": "has my application for discover card gone through yet",
+      "label": 103,
+      "label_name": "application_status"
+    },
+    {
+      "id": "4389",
+      "text": "i'd like to buy a lamp online",
+      "label": 16,
+      "label_name": "order"
+    },
+    {
+      "id": "758",
+      "text": "do i have money in my wells fargo account for nike's",
+      "label": 35,
+      "label_name": "balance"
+    },
+    {
+      "id": "1739",
+      "text": "i'm too drunk to drive and need an uber home",
+      "label": 39,
+      "label_name": "uber"
+    }
+  ]
+}

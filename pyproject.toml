@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llm-cluster"
+version = "0.1.0"
+description = "LLM-assisted text clustering experiments."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "datasets>=2.18.0",
+    "openai>=1.40.0",
+]
+
+[project.scripts]
+llm-cluster-clinc = "llm_cluster.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["llm_cluster*"]
