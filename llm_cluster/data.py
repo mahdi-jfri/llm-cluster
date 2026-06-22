@@ -59,7 +59,9 @@ def load_clinc(
                 label_field=None,
                 remove_label_names=remove_labels,
             )
-        except Exception as exc:  # pragma: no cover - fallback path depends on HF state.
+        except (
+            Exception
+        ) as exc:  # pragma: no cover - fallback path depends on HF state.
             errors.append(f"{candidate_id}: {exc}")
 
     joined_errors = "\n".join(errors)
@@ -133,7 +135,9 @@ def _infer_field(fields: Sequence[str], candidates: Sequence[str], kind: str) ->
         if candidate in fields:
             return candidate
     field_list = ", ".join(fields)
-    raise ValueError(f"Could not infer {kind} field from available fields: {field_list}")
+    raise ValueError(
+        f"Could not infer {kind} field from available fields: {field_list}"
+    )
 
 
 def _resolve_label_name(label: Any, label_names: Sequence[str]) -> str:

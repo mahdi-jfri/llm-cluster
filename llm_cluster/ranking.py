@@ -106,10 +106,11 @@ def _quicksort_by_distance(
         else:
             right.append(row)
 
+    left_rng, right_rng = _branch_rngs(rng)
     return [
-        *_quicksort_by_distance(anchor, left, comparator, rng),
+        *_quicksort_by_distance(anchor, left, comparator, left_rng),
         pivot,
-        *_quicksort_by_distance(anchor, right, comparator, rng),
+        *_quicksort_by_distance(anchor, right, comparator, right_rng),
     ]
 
 
@@ -142,12 +143,21 @@ async def _quicksort_by_distance_async(
         else:
             right.append(row)
 
-    left_sorted = await _quicksort_by_distance_async(anchor, left, comparator, rng)
-    right_sorted = await _quicksort_by_distance_async(anchor, right, comparator, rng)
+    left_rng, right_rng = _branch_rngs(rng)
+    left_sorted, right_sorted = await asyncio.gather(
+        _quicksort_by_distance_async(anchor, left, comparator, left_rng),
+        _quicksort_by_distance_async(anchor, right, comparator, right_rng),
+    )
     return [*left_sorted, pivot, *right_sorted]
 
 
-def evaluate_in_cluster_ranking(anchor: TextRow, ranked_rows: Sequence[TextRow]) -> RankingMetrics:
+def _branch_rngs(rng: random.Random) -> tuple[random.Random, random.Random]:
+    return random.Random(rng.getrandbits(64)), random.Random(rng.getrandbits(64))
+
+
+def evaluate_in_cluster_ranking(
+    anchor: TextRow, ranked_rows: Sequence[TextRow]
+) -> RankingMetrics:
     """Evaluate a ranking by counting out-of-cluster-before-in-cluster inversions."""
 
     relevance = [

@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import atexit
 import json
+import sqlite3
+import time
+import weakref
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import RLock
@@ -10,8 +15,9 @@ from typing import Any
 from llm_cluster.models import ChatModel, Message
 
 COMPARISON_PROMPT_VERSION = "distance-comparison-v1"
-DEFAULT_COMPARISON_CACHE_PATH = ".cache/llm-cluster/comparisons.jsonl"
+DEFAULT_COMPARISON_CACHE_PATH = ".cache/llm-cluster/comparisons.sqlite"
 ComparisonInput = tuple[str, str, str, str]
+ComparisonProgressCallback = Callable[[str], None]
 
 COMPARISON_RESPONSE_FORMAT: dict[str, Any] = {
     "type": "json_schema",
@@ -40,53 +46,122 @@ class ComparisonResult:
 @dataclass
 class ComparisonCache:
     path: str | Path = DEFAULT_COMPARISON_CACHE_PATH
+    sync_interval_seconds: float = 5.0
+    flush_batch_size: int = 1000
 
     def __post_init__(self) -> None:
         self.path = Path(self.path)
-        self._records: dict[str, ComparisonResult] = {}
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = RLock()
-        self._load()
+        self._connection = sqlite3.connect(self.path, check_same_thread=False)
+        self._connection.row_factory = sqlite3.Row
+        self._initialize()
+        self._records = self._load_records()
+        self._pending_records: dict[str, ComparisonResult] = {}
+        self._last_sync_at = time.monotonic()
+        self._closed = False
+        atexit.register(self.close)
 
     def get(self, key: str) -> ComparisonResult | None:
         with self._lock:
             return self._records.get(key)
 
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._records)
+
+    @property
+    def pending_count(self) -> int:
+        with self._lock:
+            return len(self._pending_records)
+
     def set(self, key: str, result: ComparisonResult) -> ComparisonResult:
         with self._lock:
+            if self._closed:
+                raise RuntimeError("Cannot write to a closed comparison cache.")
             existing = self._records.get(key)
             if existing is not None:
                 return existing
 
             self._records[key] = result
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            with self.path.open("a", encoding="utf-8") as file:
-                file.write(
-                    json.dumps(
-                        {
-                            "key": key,
-                            "reasoning": result.reasoning,
-                            "is_ab_less_than_cd": result.is_ab_less_than_cd,
-                        },
-                        ensure_ascii=False,
-                    )
-                )
-                file.write("\n")
+            self._pending_records[key] = result
+            if self._should_flush():
+                self._flush_pending()
             return result
 
-    def _load(self) -> None:
-        if not self.path.exists():
+    def flush(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._flush_pending()
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._flush_pending()
+            self._connection.close()
+            self._closed = True
+
+    def _initialize(self) -> None:
+        with self._lock:
+            self._connection.execute("PRAGMA journal_mode=WAL")
+            self._connection.execute("PRAGMA synchronous=NORMAL")
+            self._connection.execute("""
+                CREATE TABLE IF NOT EXISTS comparisons (
+                    key TEXT PRIMARY KEY,
+                    reasoning TEXT NOT NULL,
+                    is_ab_less_than_cd INTEGER NOT NULL CHECK (
+                        is_ab_less_than_cd IN (0, 1)
+                    ),
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """)
+            self._connection.commit()
+
+    def _load_records(self) -> dict[str, ComparisonResult]:
+        with self._lock:
+            rows = self._connection.execute("""
+                SELECT key, reasoning, is_ab_less_than_cd
+                FROM comparisons
+                """)
+            return {
+                row["key"]: ComparisonResult(
+                    reasoning=row["reasoning"],
+                    is_ab_less_than_cd=bool(row["is_ab_less_than_cd"]),
+                )
+                for row in rows
+            }
+
+    def _should_flush(self) -> bool:
+        if not self._pending_records:
+            return False
+        if (
+            self.flush_batch_size > 0
+            and len(self._pending_records) >= self.flush_batch_size
+        ):
+            return True
+        if self.sync_interval_seconds <= 0:
+            return True
+        return time.monotonic() - self._last_sync_at >= self.sync_interval_seconds
+
+    def _flush_pending(self) -> None:
+        if not self._pending_records:
             return
 
-        with self.path.open(encoding="utf-8") as file:
-            for line in file:
-                if not line.strip():
-                    continue
-                record = json.loads(line)
-                key = record["key"]
-                self._records[key] = ComparisonResult(
-                    reasoning=record["reasoning"],
-                    is_ab_less_than_cd=record["is_ab_less_than_cd"],
-                )
+        self._connection.executemany(
+            """
+            INSERT OR IGNORE INTO comparisons (key, reasoning, is_ab_less_than_cd)
+            VALUES (?, ?, ?)
+            """,
+            [
+                (key, result.reasoning, int(result.is_ab_less_than_cd))
+                for key, result in self._pending_records.items()
+            ],
+        )
+        self._connection.commit()
+        self._pending_records.clear()
+        self._last_sync_at = time.monotonic()
 
 
 @dataclass
@@ -97,8 +172,13 @@ class LLMDistanceComparator:
     temperature: float = 0.0
     max_tokens: int = 1024
     max_concurrency: int = 4
+    max_batch_size: int = 1
     parse_retries: int = 2
     cache: ComparisonCache | None = field(default_factory=ComparisonCache)
+    progress_callback: ComparisonProgressCallback | None = None
+    _async_semaphores: weakref.WeakKeyDictionary[
+        asyncio.AbstractEventLoop, dict[int, asyncio.Semaphore]
+    ] = field(default_factory=weakref.WeakKeyDictionary, init=False, repr=False)
 
     def compare(self, a: str, b: str, c: str, d: str) -> ComparisonResult:
         cache = self.cache
@@ -106,11 +186,13 @@ class LLMDistanceComparator:
         if cache is not None:
             cached_result = cache.get(cache_key)
             if cached_result is not None:
+                self._notify_progress("cached")
                 return cached_result
 
         result = self._generate_and_parse(a, b, c, d)
         if cache is not None:
             result = cache.set(cache_key, result)
+        self._notify_progress("generated")
         return result
 
     def compare_batch(
@@ -119,8 +201,14 @@ class LLMDistanceComparator:
         *,
         max_concurrency: int | None = None,
     ) -> list[ComparisonResult]:
-        concurrency = max_concurrency if max_concurrency is not None else self.max_concurrency
-        if concurrency > 1 and hasattr(self.model, "generate_async"):
+        concurrency = (
+            max_concurrency if max_concurrency is not None else self.max_concurrency
+        )
+        can_batch = self.max_batch_size > 1 and hasattr(
+            self.model,
+            "generate_batch_async",
+        )
+        if can_batch or (concurrency > 1 and hasattr(self.model, "generate_async")):
             return asyncio.run(
                 self.compare_batch_async(
                     comparisons,
@@ -143,9 +231,12 @@ class LLMDistanceComparator:
 
         for index, comparison in enumerate(comparisons):
             cache_key = comparison_cache_key(*comparison)
-            cached_result = self.cache.get(cache_key) if self.cache is not None else None
+            cached_result = (
+                self.cache.get(cache_key) if self.cache is not None else None
+            )
             if cached_result is not None:
                 results[index] = cached_result
+                self._notify_progress("cached")
                 continue
 
             pending = pending_by_key.get(cache_key)
@@ -155,28 +246,56 @@ class LLMDistanceComparator:
                 pending[1].append(index)
 
         if pending_by_key:
-            concurrency = max_concurrency if max_concurrency is not None else self.max_concurrency
-            concurrency = min(max(1, concurrency), len(pending_by_key))
-            if concurrency == 1 or not hasattr(self.model, "generate_async"):
+            concurrency = (
+                max_concurrency if max_concurrency is not None else self.max_concurrency
+            )
+            concurrency = max(1, concurrency)
+            can_batch = self.max_batch_size > 1 and hasattr(
+                self.model,
+                "generate_batch_async",
+            )
+            if (
+                concurrency == 1 or not hasattr(self.model, "generate_async")
+            ) and not can_batch:
                 for comparison, indexes in pending_by_key.values():
                     result = self.compare(*comparison)
                     for index in indexes:
                         results[index] = result
             else:
-                semaphore = asyncio.Semaphore(concurrency)
-                tasks = [
-                    (
-                        asyncio.create_task(
-                            self.compare_async(*comparison, semaphore=semaphore)
-                        ),
-                        indexes,
-                    )
-                    for comparison, indexes in pending_by_key.values()
-                ]
-                for task, indexes in tasks:
-                    result = await task
-                    for index in indexes:
-                        results[index] = result
+                semaphore = self._get_async_semaphore(concurrency)
+                pending_items = list(pending_by_key.values())
+                if can_batch:
+                    tasks = [
+                        (
+                            asyncio.create_task(
+                                self.compare_many_async(
+                                    [comparison for comparison, _ in chunk],
+                                    semaphore=semaphore,
+                                )
+                            ),
+                            [indexes for _, indexes in chunk],
+                        )
+                        for chunk in _chunks(pending_items, self.max_batch_size)
+                    ]
+                    task_results = await asyncio.gather(*(task for task, _ in tasks))
+                    for chunk_results, (_, chunk_indexes) in zip(task_results, tasks):
+                        for result, indexes in zip(chunk_results, chunk_indexes):
+                            for index in indexes:
+                                results[index] = result
+                else:
+                    tasks = [
+                        (
+                            asyncio.create_task(
+                                self.compare_async(*comparison, semaphore=semaphore)
+                            ),
+                            indexes,
+                        )
+                        for comparison, indexes in pending_items
+                    ]
+                    task_results = await asyncio.gather(*(task for task, _ in tasks))
+                    for result, (_, indexes) in zip(task_results, tasks):
+                        for index in indexes:
+                            results[index] = result
 
         resolved_results: list[ComparisonResult] = []
         for result in results:
@@ -199,6 +318,7 @@ class LLMDistanceComparator:
         if cache is not None:
             cached_result = cache.get(cache_key)
             if cached_result is not None:
+                self._notify_progress("cached")
                 return cached_result
 
         if not hasattr(self.model, "generate_async"):
@@ -207,13 +327,57 @@ class LLMDistanceComparator:
         result = await self._generate_and_parse_async(a, b, c, d, semaphore=semaphore)
         if cache is not None:
             result = cache.set(cache_key, result)
+        self._notify_progress("generated")
         return result
+
+    async def compare_many_async(
+        self,
+        comparisons: list[ComparisonInput],
+        *,
+        semaphore: asyncio.Semaphore | None = None,
+    ) -> list[ComparisonResult]:
+        if not comparisons:
+            return []
+        if not hasattr(self.model, "generate_batch_async"):
+            return [
+                await self.compare_async(*comparison, semaphore=semaphore)
+                for comparison in comparisons
+            ]
+
+        results = await self._generate_and_parse_many_async(
+            comparisons,
+            semaphore=semaphore,
+        )
+        resolved_results: list[ComparisonResult] = []
+        for comparison, result in zip(comparisons, results):
+            if self.cache is not None:
+                result = self.cache.set(comparison_cache_key(*comparison), result)
+            self._notify_progress("generated")
+            resolved_results.append(result)
+        return resolved_results
 
     def _compare_batch_sequential(
         self,
         comparisons: list[ComparisonInput],
     ) -> list[ComparisonResult]:
         return [self.compare(*comparison) for comparison in comparisons]
+
+    def _get_async_semaphore(self, concurrency: int) -> asyncio.Semaphore:
+        loop = asyncio.get_running_loop()
+        loop_semaphores = self._async_semaphores.get(loop)
+        if loop_semaphores is None:
+            loop_semaphores = {}
+            self._async_semaphores[loop] = loop_semaphores
+
+        semaphore = loop_semaphores.get(concurrency)
+        if semaphore is None:
+            semaphore = asyncio.Semaphore(concurrency)
+            loop_semaphores[concurrency] = semaphore
+        return semaphore
+
+    def _notify_progress(self, event: str) -> None:
+        if self.progress_callback is not None:
+            self.progress_callback(event)
 
     def _generate_and_parse(self, a: str, b: str, c: str, d: str) -> ComparisonResult:
         messages = build_distance_comparison_messages(a, b, c, d)
@@ -270,6 +434,51 @@ class LLMDistanceComparator:
             raise RuntimeError("Comparison generation failed without an error.")
         raise last_error
 
+    async def _generate_and_parse_many_async(
+        self,
+        comparisons: list[ComparisonInput],
+        *,
+        semaphore: asyncio.Semaphore | None = None,
+    ) -> list[ComparisonResult]:
+        messages_batch = [
+            build_distance_comparison_messages(a, b, c, d) for a, b, c, d in comparisons
+        ]
+        generate_batch_async = getattr(self.model, "generate_batch_async")
+        last_error: Exception | None = None
+        for _ in range(self.parse_retries + 1):
+            if semaphore is None:
+                raw_responses = await generate_batch_async(
+                    messages_batch,
+                    response_format=COMPARISON_RESPONSE_FORMAT,
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens,
+                )
+            else:
+                async with semaphore:
+                    raw_responses = await generate_batch_async(
+                        messages_batch,
+                        response_format=COMPARISON_RESPONSE_FORMAT,
+                        temperature=self.temperature,
+                        max_tokens=self.max_tokens,
+                    )
+
+            if len(raw_responses) != len(comparisons):
+                raise RuntimeError(
+                    "Batch comparison generation did not produce every response."
+                )
+
+            try:
+                return [
+                    parse_comparison_response(raw_response)
+                    for raw_response in raw_responses
+                ]
+            except (ValueError, json.JSONDecodeError) as exc:
+                last_error = exc
+
+        if last_error is None:
+            raise RuntimeError("Batch comparison generation failed without an error.")
+        raise last_error
+
 
 def compare(
     a: str,
@@ -282,6 +491,16 @@ def compare(
     """Return whether d(a, b) is less than d(c, d)."""
 
     return comparator.compare(a, b, c, d).is_ab_less_than_cd
+
+
+def _chunks(
+    items: list[tuple[ComparisonInput, list[int]]],
+    size: int,
+) -> list[list[tuple[ComparisonInput, list[int]]]]:
+    chunk_size = max(1, size)
+    return [
+        items[start : start + chunk_size] for start in range(0, len(items), chunk_size)
+    ]
 
 
 def build_distance_comparison_messages(
@@ -321,13 +540,15 @@ Question: is d(A, B) strictly less than d(C, D)?"""
 
 
 def comparison_cache_key(a: str, b: str, c: str, d: str) -> str:
+    canonical_a, canonical_b = sorted((a, b))
+    canonical_c, canonical_d = sorted((c, d))
     return json.dumps(
         {
             "version": COMPARISON_PROMPT_VERSION,
-            "a": a,
-            "b": b,
-            "c": c,
-            "d": d,
+            "a": canonical_a,
+            "b": canonical_b,
+            "c": canonical_c,
+            "d": canonical_d,
         },
         sort_keys=True,
         ensure_ascii=False,
