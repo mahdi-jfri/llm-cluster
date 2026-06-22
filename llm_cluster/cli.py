@@ -14,6 +14,12 @@ from llm_cluster.clustering import (
 )
 from llm_cluster.comparison import ComparisonCache, LLMDistanceComparator
 from llm_cluster.data import TextRow, load_clinc
+from llm_cluster.embedding_clustering import (
+    CLINC_INTENT_INSTRUCTOR_PROMPT,
+    DEFAULT_INSTRUCTOR_MODEL_NAME,
+    EmbeddingClusteringResult,
+    embedding_kmeans_cluster,
+)
 from llm_cluster.metrics import evaluate_clustering
 from llm_cluster.models import load_model
 from llm_cluster.ranking import evaluate_in_cluster_ranking, sort_by_distance
@@ -21,9 +27,13 @@ from llm_cluster.ranking import evaluate_in_cluster_ranking, sort_by_distance
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Rank or cluster CLINC rows with an LLM-judged distance oracle."
+        description="Rank or cluster CLINC rows with LLM comparisons or embeddings."
     )
-    parser.add_argument("--task", choices=("rank", "cluster"), default="rank")
+    parser.add_argument(
+        "--task",
+        choices=("rank", "cluster", "embedding-cluster"),
+        default="rank",
+    )
     parser.add_argument("--dataset-id", default=None)
     parser.add_argument("--config", default="plus")
     parser.add_argument("--split", default="test")
@@ -40,7 +50,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--cluster-count",
         type=int,
         default=None,
-        help="Target k for successive-sampling clustering. Required with --task cluster.",
+        help=(
+            "Target k for clustering. Required with --task cluster and "
+            "--task embedding-cluster."
+        ),
     )
     parser.add_argument(
         "--cluster-sample-multiplier",
@@ -62,6 +75,51 @@ def main(argv: Sequence[str] | None = None) -> int:
             "Return raw O(k log(n/k)) sampled clusters instead of compressing "
             "to exactly --cluster-count centers."
         ),
+    )
+    parser.add_argument(
+        "--embedding-model-name",
+        default=DEFAULT_INSTRUCTOR_MODEL_NAME,
+        help="Embedding model used with --task embedding-cluster.",
+    )
+    parser.add_argument(
+        "--embedding-prompt",
+        default=CLINC_INTENT_INSTRUCTOR_PROMPT,
+        help="INSTRUCTOR prompt prepended to each utterance.",
+    )
+    parser.add_argument(
+        "--embedding-batch-size",
+        type=int,
+        default=64,
+        help="Batch size for embedding model encoding.",
+    )
+    parser.add_argument(
+        "--embedding-device",
+        default=None,
+        help="Optional torch device for the embedding model, such as cuda or cpu.",
+    )
+    parser.add_argument(
+        "--no-embedding-normalize",
+        dest="embedding_normalize",
+        action="store_false",
+        help="Disable L2 normalization before KMeans.",
+    )
+    parser.set_defaults(embedding_normalize=True)
+    parser.add_argument(
+        "--embedding-progress",
+        action="store_true",
+        help="Show the embedding model's encode progress bar.",
+    )
+    parser.add_argument(
+        "--embedding-kmeans-n-init",
+        type=int,
+        default=10,
+        help="Number of KMeans initializations.",
+    )
+    parser.add_argument(
+        "--embedding-kmeans-max-iter",
+        type=int,
+        default=300,
+        help="Maximum KMeans iterations.",
     )
     parser.add_argument("--provider", default="openrouter")
     parser.add_argument("--model-name", default="qwen/qwen3.5-9b")
@@ -115,15 +173,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError("--comparison-cache-sync-interval must be non-negative.")
     if args.comparison_cache_flush_size < 0:
         raise ValueError("--comparison-cache-flush-size must be non-negative.")
-    if args.task == "cluster":
+    cluster_tasks = {"cluster", "embedding-cluster"}
+    if args.task in cluster_tasks:
         if args.cluster_count is None:
-            raise ValueError("--cluster-count is required when --task cluster.")
+            raise ValueError(
+                "--cluster-count is required when --task cluster or "
+                "--task embedding-cluster."
+            )
         if args.cluster_count < 1:
             raise ValueError("--cluster-count must be at least 1.")
+    if args.task == "cluster":
         if args.cluster_sample_multiplier <= 0:
             raise ValueError("--cluster-sample-multiplier must be positive.")
         if not 0 < args.cluster_cover_fraction < 1:
             raise ValueError("--cluster-cover-fraction must be between 0 and 1.")
+    if args.task == "embedding-cluster":
+        if args.embedding_batch_size < 1:
+            raise ValueError("--embedding-batch-size must be at least 1.")
+        if args.embedding_kmeans_n_init < 1:
+            raise ValueError("--embedding-kmeans-n-init must be at least 1.")
+        if args.embedding_kmeans_max_iter < 1:
+            raise ValueError("--embedding-kmeans-max-iter must be at least 1.")
 
     rows = load_clinc(
         split=args.split,
@@ -148,7 +218,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         random.Random(args.candidate_seed).shuffle(candidates)
         if args.candidate_limit > 0:
             candidates = candidates[: args.candidate_limit]
-    else:
+    elif args.task in cluster_tasks:
         cluster_rows = list(rows)
         random.Random(args.candidate_seed).shuffle(cluster_rows)
         if args.candidate_limit > 0:
@@ -156,121 +226,171 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not cluster_rows:
             raise RuntimeError("No rows selected for clustering.")
 
-    model_kwargs = {}
-    if args.model_base_url is not None:
-        model_kwargs["base_url"] = args.model_base_url
-    if args.model_api_key is not None:
-        model_kwargs["api_key"] = args.model_api_key
-
-    model = load_model(args.provider, args.model_name, **model_kwargs)
-    comparison_batch_size = (
-        args.comparison_batch_size if hasattr(model, "generate_batch_async") else 1
-    )
-    cache = (
-        None
-        if args.no_comparison_cache
-        else ComparisonCache(
-            args.comparison_cache_path,
-            sync_interval_seconds=args.comparison_cache_sync_interval,
-            flush_batch_size=args.comparison_cache_flush_size,
-        )
-    )
-    progress = None
-    if args.progress_interval > 0:
-        progress = _ProgressReporter(
-            cache=cache,
-            interval_seconds=args.progress_interval,
-        )
-        print(
-            "[llm-cluster] "
-            f"task={args.task} loaded_rows={len(rows):,} "
-            f"{_task_progress_details(args.task, anchor, candidates, cluster_rows)} "
-            f"provider={args.provider} model={getattr(model, 'model_name', args.model_name)} "
-            f"concurrency={args.comparison_concurrency} "
-            f"batch_size={comparison_batch_size} "
-            f"cache={'disabled' if cache is None else args.comparison_cache_path} "
-            f"cache_sync_interval={args.comparison_cache_sync_interval:g}s "
-            f"cache_flush_size={args.comparison_cache_flush_size}",
-            file=sys.stderr,
-            flush=True,
-        )
-
-    comparator = LLMDistanceComparator(
-        model=model,
-        temperature=args.temperature,
-        max_tokens=args.max_tokens,
-        max_concurrency=args.comparison_concurrency,
-        max_batch_size=comparison_batch_size,
-        parse_retries=args.comparison_retries,
-        cache=cache,
-        progress_callback=progress,
-    )
+    cache: ComparisonCache | None = None
+    progress: _ProgressReporter | None = None
 
     try:
-        if args.task == "rank":
-            if anchor is None:
-                raise RuntimeError("Ranking task did not initialize an anchor.")
-            ranked_rows = sort_by_distance(
-                anchor,
-                candidates,
-                comparator,
-                seed=args.sort_seed,
+        if args.task in {"rank", "cluster"}:
+            model_kwargs = {}
+            if args.model_base_url is not None:
+                model_kwargs["base_url"] = args.model_base_url
+            if args.model_api_key is not None:
+                model_kwargs["api_key"] = args.model_api_key
+
+            model = load_model(args.provider, args.model_name, **model_kwargs)
+            comparison_batch_size = (
+                args.comparison_batch_size
+                if hasattr(model, "generate_batch_async")
+                else 1
             )
-            metrics = evaluate_in_cluster_ranking(anchor, ranked_rows)
-            output = {
-                "dataset": {
-                    "split": args.split,
-                    "config": args.config,
-                    "n_loaded_rows": len(rows),
-                    "n_ranked_candidates": len(ranked_rows),
-                    "oos_removed": not args.include_oos,
-                    "candidate_seed": args.candidate_seed,
-                    "sort_seed": args.sort_seed,
-                    "comparison_concurrency": args.comparison_concurrency,
-                    "comparison_batch_size": comparison_batch_size,
-                    "comparison_retries": args.comparison_retries,
-                    "comparison_cache_enabled": cache is not None,
-                    "comparison_cache_sync_interval": (
-                        args.comparison_cache_sync_interval
-                        if cache is not None
-                        else None
-                    ),
-                    "comparison_cache_flush_size": (
-                        args.comparison_cache_flush_size if cache is not None else None
-                    ),
-                },
-                "model": {
-                    "provider": args.provider,
-                    "model_name": args.model_name,
-                    "resolved_model_name": getattr(
-                        model, "model_name", args.model_name
-                    ),
-                },
-                "anchor": _row_to_dict(anchor),
-                "metrics": metrics.as_dict(),
-                "ranked_rows": [_row_to_dict(row) for row in ranked_rows],
-            }
+            cache = (
+                None
+                if args.no_comparison_cache
+                else ComparisonCache(
+                    args.comparison_cache_path,
+                    sync_interval_seconds=args.comparison_cache_sync_interval,
+                    flush_batch_size=args.comparison_cache_flush_size,
+                )
+            )
+            if args.progress_interval > 0:
+                progress = _ProgressReporter(
+                    cache=cache,
+                    interval_seconds=args.progress_interval,
+                )
+                print(
+                    "[llm-cluster] "
+                    f"task={args.task} loaded_rows={len(rows):,} "
+                    f"{_task_progress_details(args.task, anchor, candidates, cluster_rows)} "
+                    f"provider={args.provider} "
+                    f"model={getattr(model, 'model_name', args.model_name)} "
+                    f"concurrency={args.comparison_concurrency} "
+                    f"batch_size={comparison_batch_size} "
+                    f"cache={'disabled' if cache is None else args.comparison_cache_path} "
+                    f"cache_sync_interval={args.comparison_cache_sync_interval:g}s "
+                    f"cache_flush_size={args.comparison_cache_flush_size}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+            comparator = LLMDistanceComparator(
+                model=model,
+                temperature=args.temperature,
+                max_tokens=args.max_tokens,
+                max_concurrency=args.comparison_concurrency,
+                max_batch_size=comparison_batch_size,
+                parse_retries=args.comparison_retries,
+                cache=cache,
+                progress_callback=progress,
+            )
+
+            if args.task == "rank":
+                if anchor is None:
+                    raise RuntimeError("Ranking task did not initialize an anchor.")
+                ranked_rows = sort_by_distance(
+                    anchor,
+                    candidates,
+                    comparator,
+                    seed=args.sort_seed,
+                )
+                metrics = evaluate_in_cluster_ranking(anchor, ranked_rows)
+                output = {
+                    "dataset": {
+                        "split": args.split,
+                        "config": args.config,
+                        "n_loaded_rows": len(rows),
+                        "n_ranked_candidates": len(ranked_rows),
+                        "oos_removed": not args.include_oos,
+                        "candidate_seed": args.candidate_seed,
+                        "sort_seed": args.sort_seed,
+                        "comparison_concurrency": args.comparison_concurrency,
+                        "comparison_batch_size": comparison_batch_size,
+                        "comparison_retries": args.comparison_retries,
+                        "comparison_cache_enabled": cache is not None,
+                        "comparison_cache_sync_interval": (
+                            args.comparison_cache_sync_interval
+                            if cache is not None
+                            else None
+                        ),
+                        "comparison_cache_flush_size": (
+                            args.comparison_cache_flush_size
+                            if cache is not None
+                            else None
+                        ),
+                    },
+                    "model": {
+                        "provider": args.provider,
+                        "model_name": args.model_name,
+                        "resolved_model_name": getattr(
+                            model, "model_name", args.model_name
+                        ),
+                    },
+                    "anchor": _row_to_dict(anchor),
+                    "metrics": metrics.as_dict(),
+                    "ranked_rows": [_row_to_dict(row) for row in ranked_rows],
+                }
+            else:
+                if args.cluster_count is None:
+                    raise RuntimeError(
+                        "Clustering task did not receive --cluster-count."
+                    )
+                final_center_count = (
+                    None if args.no_cluster_exact_k else args.cluster_count
+                )
+                clustering = successive_sampling_cluster(
+                    cluster_rows,
+                    comparator,
+                    k=args.cluster_count,
+                    sample_multiplier=args.cluster_sample_multiplier,
+                    cover_fraction=args.cluster_cover_fraction,
+                    seed=args.cluster_seed,
+                    final_center_count=final_center_count,
+                )
+                output = _clustering_output(
+                    args=args,
+                    rows=rows,
+                    clustered_rows=cluster_rows,
+                    comparison_batch_size=comparison_batch_size,
+                    cache_enabled=cache is not None,
+                    clustering=clustering,
+                    model_name=getattr(model, "model_name", args.model_name),
+                )
         else:
             if args.cluster_count is None:
                 raise RuntimeError("Clustering task did not receive --cluster-count.")
-            final_center_count = None if args.no_cluster_exact_k else args.cluster_count
-            clustering = successive_sampling_cluster(
+            if args.cluster_count > len(cluster_rows):
+                raise ValueError(
+                    "--cluster-count must be <= selected rows for "
+                    "--task embedding-cluster."
+                )
+            if args.progress_interval > 0:
+                print(
+                    "[llm-cluster] "
+                    f"task={args.task} loaded_rows={len(rows):,} "
+                    f"clustered_rows={len(cluster_rows):,} "
+                    f"embedding_model={args.embedding_model_name} "
+                    f"embedding_batch_size={args.embedding_batch_size} "
+                    f"k={args.cluster_count}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            clustering = embedding_kmeans_cluster(
                 cluster_rows,
-                comparator,
                 k=args.cluster_count,
-                sample_multiplier=args.cluster_sample_multiplier,
-                cover_fraction=args.cluster_cover_fraction,
+                model_name=args.embedding_model_name,
+                prompt=args.embedding_prompt,
+                batch_size=args.embedding_batch_size,
+                normalize_embeddings=args.embedding_normalize,
                 seed=args.cluster_seed,
-                final_center_count=final_center_count,
+                device=args.embedding_device,
+                kmeans_n_init=args.embedding_kmeans_n_init,
+                kmeans_max_iter=args.embedding_kmeans_max_iter,
+                show_progress_bar=args.embedding_progress,
             )
-            output = _clustering_output(
+            output = _embedding_clustering_output(
                 args=args,
                 rows=rows,
                 clustered_rows=cluster_rows,
-                comparison_batch_size=comparison_batch_size,
-                cache_enabled=cache is not None,
                 clustering=clustering,
-                model_name=getattr(model, "model_name", args.model_name),
             )
     finally:
         if cache is not None:
@@ -363,6 +483,47 @@ def _clustering_output(
         "candidate_clusters": [
             _cluster_to_dict(cluster) for cluster in clustering.candidate_clusters
         ],
+        "clusters": [_cluster_to_dict(cluster) for cluster in clustering.clusters],
+    }
+
+
+def _embedding_clustering_output(
+    *,
+    args: argparse.Namespace,
+    rows: Sequence[TextRow],
+    clustered_rows: Sequence[TextRow],
+    clustering: EmbeddingClusteringResult,
+) -> dict[str, object]:
+    metrics = evaluate_clustering(clustering.clusters).as_dict()
+    return {
+        "dataset": {
+            "split": args.split,
+            "config": args.config,
+            "n_loaded_rows": len(rows),
+            "n_clustered_rows": len(clustered_rows),
+            "oos_removed": not args.include_oos,
+            "candidate_seed": args.candidate_seed,
+        },
+        "model": {
+            "provider": "instructor",
+            "model_name": clustering.model_name,
+            "prompt": clustering.prompt,
+        },
+        "clustering": {
+            "algorithm": "instructor_kmeans",
+            "target_clusters": clustering.target_clusters,
+            "seed": clustering.seed,
+            "batch_size": clustering.batch_size,
+            "normalize_embeddings": clustering.normalize_embeddings,
+            "device": clustering.device,
+            "kmeans_init": clustering.kmeans_init,
+            "kmeans_n_init": clustering.kmeans_n_init,
+            "kmeans_max_iter": clustering.kmeans_max_iter,
+            "embedding_shape": list(clustering.embedding_shape),
+            "inertia": clustering.inertia,
+            "n_final_centers": len(clustering.centers),
+        },
+        "metrics": metrics,
         "clusters": [_cluster_to_dict(cluster) for cluster in clustering.clusters],
     }
 

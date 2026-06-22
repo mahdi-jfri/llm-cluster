@@ -13,6 +13,13 @@ from llm_cluster.clustering import (
     successive_sampling_cluster,
 )
 from llm_cluster.data import TextRow, load_clinc, load_dataset_rows
+from llm_cluster.embedding_clustering import (
+    CLINC_INTENT_INSTRUCTOR_PROMPT,
+    DEFAULT_KMEANS_INIT,
+    DEFAULT_INSTRUCTOR_MODEL_NAME,
+    EmbeddingClusteringResult,
+    embedding_kmeans_cluster,
+)
 from llm_cluster.keys import get_api_key, load_api_keys
 from llm_cluster.metrics import ClusteringMetrics, evaluate_clustering
 from llm_cluster.models import AsyncChatModel, ChatModel, load_model
@@ -28,6 +35,10 @@ __all__ = [
     "ComparisonCache",
     "ComparisonResult",
     "ClusteringMetrics",
+    "CLINC_INTENT_INSTRUCTOR_PROMPT",
+    "DEFAULT_KMEANS_INIT",
+    "DEFAULT_INSTRUCTOR_MODEL_NAME",
+    "EmbeddingClusteringResult",
     "LLMDistanceComparator",
     "RankingMetrics",
     "SuccessiveSamplingResult",
@@ -35,6 +46,7 @@ __all__ = [
     "TextRow",
     "TextCluster",
     "compare",
+    "embedding_kmeans_cluster",
     "evaluate_in_cluster_ranking",
     "evaluate_clustering",
     "get_api_key",

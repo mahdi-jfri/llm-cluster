@@ -9,6 +9,7 @@ Starter infrastructure for LLM-assisted text clustering experiments.
 - An LLM-backed `compare(a, b, c, d)` implementation for deciding whether `d(a,b) < d(c,d)`.
 - Ranking rows by distance from an anchor row with randomized quicksort.
 - Mettu-Plaxton-style successive sampling clustering using the same comparison oracle.
+- Embedding-based CLINC clustering with INSTRUCTOR embeddings and KMeans.
 - A persistent SQLite comparison cache so repeated `compare(a, b, c, d)` calls reuse the same result.
 - Async parallel comparison batches for quicksort partitions with bounded API concurrency.
 - An in-cluster ranking metric based on inversions between in-cluster rows (`1`) and out-cluster rows (`0`).
@@ -117,6 +118,39 @@ all rows to those centers. Use `--no-cluster-exact-k` to return the raw
 `O(k log(n/k))` sampled-center clustering instead. Use `--candidate-limit 0` to
 cluster all loaded rows. The clustering JSON includes `metrics` for the final
 clusters and `candidate_metrics` for the raw sampled-center clusters.
+
+## Run CLINC Embedding Clustering
+
+Use `--task embedding-cluster` to encode CLINC utterances with
+`hkunlp/instructor-large` and cluster the vectors with KMeans using k-means++
+initialization. The default INSTRUCTOR prompt is exactly:
+
+```python
+prompt = "Represent utterances for intent classification: "
+```
+
+The prompt includes the trailing colon and space.
+
+```bash
+.venv/bin/python -m llm_cluster.cli \
+  --task embedding-cluster \
+  --cluster-count 150 \
+  --candidate-limit 0 \
+  --candidate-seed 0 \
+  --cluster-seed 0 \
+  --embedding-batch-size 64
+```
+
+Or use the script:
+
+```bash
+scripts/run_instructor_embedding_clustering.sh
+```
+
+Override `--embedding-device cuda` or `--embedding-device cpu` when you need to
+pin the model to a specific torch device. The JSON output includes the embedding
+model, prompt, normalization setting, KMeans initialization/settings, metrics,
+and clusters.
 
 ## Sources
 
