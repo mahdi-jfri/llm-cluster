@@ -27,7 +27,7 @@ DEFAULT_DELTA = 5
 DEFAULT_ORACLE_COMPARISON_BATCH_SIZE = 8192
 NOTEBOOK_RECURSION_LIMIT = 10_000_000
 TERMINAL_THRESHOLD = 100
-SAFE_PREFIX_DIV = 2
+SAFE_PREFIX_DIVISOR = 2
 NearestEdgeStrategy = Literal["sort"]
 DEFAULT_NEAREST_EDGE_STRATEGY: NearestEdgeStrategy = "sort"
 VALID_NEAREST_EDGE_STRATEGIES = frozenset(("sort",))
@@ -119,8 +119,6 @@ def _edge_distances_for_rows(
     left_rows: Sequence[TextRow],
     right_rows: Sequence[TextRow],
     edge_distance_matrix: EdgeDistanceMatrix,
-    *,
-    mask_self_edges: bool,
 ) -> Any:
     import numpy as np
 
@@ -137,25 +135,7 @@ def _edge_distances_for_rows(
             f"{distances.shape!r}, expected {expected_shape!r}."
         )
 
-    if not mask_self_edges:
-        return distances
-
-    right_positions_by_id: dict[str, list[int]] = {}
-    for right_index, row in enumerate(right_rows):
-        right_positions_by_id.setdefault(row.id, []).append(right_index)
-
-    masked_distances = distances
-    copied = False
-    for left_index, row in enumerate(left_rows):
-        right_positions = right_positions_by_id.get(row.id)
-        if not right_positions:
-            continue
-        if not copied:
-            masked_distances = np.array(distances, copy=True)
-            copied = True
-        masked_distances[left_index, right_positions] = np.inf
-
-    return masked_distances
+    return distances
 
 
 @dataclass(frozen=True)
@@ -317,8 +297,6 @@ async def _weak_comparison_alg_g_cluster_async_impl(
             sample2_multiplier=sample2_multiplier,
             rng=rng,
         )
-        if not samples.sample1 or not samples.sample2:
-            break
 
         sample_ids = {row.id for row in (*samples.sample1, *samples.sample2)}
         non_sample_rows = [row for row in active if row.id not in sample_ids]
@@ -397,7 +375,7 @@ async def _weak_comparison_alg_g_cluster_async_impl(
         )
         safe_threshold = min(
             len(ordered_nearest_edges),
-            max(1, n_active_before // SAFE_PREFIX_DIV),
+            max(1, n_active_before // SAFE_PREFIX_DIVISOR),
         )
         safe_edges = ordered_nearest_edges[:safe_threshold]
         safe_ids = {edge.right.id for edge in safe_edges}
@@ -426,9 +404,6 @@ async def _weak_comparison_alg_g_cluster_async_impl(
                 sample2_center_ids=tuple(row.id for row in samples.sample2),
             )
         )
-
-        if len(active) >= n_active_before:
-            break
 
     _print_weak_comparison_stage("assign_terminal_rows", active=len(active))
     for row in active:
@@ -610,7 +585,9 @@ class _AlgTestComparator:
         self,
         edge_pairs: Sequence[tuple[_ComparisonEdge, _ComparisonEdge]],
     ) -> list[bool]:
-        if _has_index_batch_bool_comparator(self.comparator):
+        if _has_index_grouped_majority_comparator(
+            self.comparator
+        ) or _has_index_batch_bool_comparator(self.comparator):
             return await self._compare_edge_pair_chunk_by_index_async(edge_pairs)
 
         test_cases = [self._build_case(edge1, edge2) for edge1, edge2 in edge_pairs]
@@ -664,6 +641,52 @@ class _AlgTestComparator:
             comparison_count += len(cd_left_values)
 
         if comparison_count == 0:
+            return answers
+
+        if _has_index_grouped_majority_comparator(self.comparator):
+            pair_indexes = np.empty(len(specs), dtype=np.intp)
+            ab_left_indexes = np.empty(len(specs), dtype=np.int64)
+            ab_right_indexes = np.empty(len(specs), dtype=np.int64)
+            cd_right_indexes = np.empty(len(specs), dtype=np.int64)
+            invert_majority = np.empty(len(specs), dtype=bool)
+            cd_left_indexes = np.empty(comparison_count, dtype=np.int64)
+            offsets = np.empty(len(specs) + 1, dtype=np.int64)
+            offsets[0] = 0
+
+            offset = 0
+            for spec_index, (
+                pair_index,
+                ab_left,
+                ab_right,
+                cd_left_values,
+                cd_right,
+                invert,
+            ) in enumerate(specs):
+                end = offset + len(cd_left_values)
+                pair_indexes[spec_index] = pair_index
+                ab_left_indexes[spec_index] = ab_left
+                ab_right_indexes[spec_index] = ab_right
+                cd_right_indexes[spec_index] = cd_right
+                invert_majority[spec_index] = invert
+                cd_left_indexes[offset:end] = cd_left_values
+                offsets[spec_index + 1] = end
+                offset = end
+
+            grouped_results = await _compare_index_grouped_majority_bool_async(
+                self.comparator,
+                ab_left_indexes=ab_left_indexes,
+                ab_right_indexes=ab_right_indexes,
+                cd_left_indexes=cd_left_indexes,
+                cd_right_indexes=cd_right_indexes,
+                offsets=offsets,
+                invert_majority=invert_majority,
+            )
+            if len(grouped_results) != len(specs):
+                raise RuntimeError(
+                    "Indexed comparator returned an unexpected result count."
+                )
+            for pair_index, answer in zip(pair_indexes, grouped_results):
+                answers[int(pair_index)] = bool(answer)
             return answers
 
         comparisons = np.empty((comparison_count, 4), dtype=np.int64)
@@ -902,25 +925,6 @@ class _AlgTestCase:
         if self.invert_majority:
             return not majority_not_smaller
         return majority_not_smaller
-
-
-def _resolve_alg_test_results(
-    results: Sequence[bool],
-    *,
-    start: int,
-    end: int,
-    invert_majority: bool,
-) -> bool:
-    not_smaller_count = 0
-    for index in range(start, end):
-        if not results[index]:
-            not_smaller_count += 1
-
-    return _resolve_alg_test_count(
-        not_smaller_count=not_smaller_count,
-        result_count=end - start,
-        invert_majority=invert_majority,
-    )
 
 
 def _resolve_alg_test_count(
@@ -1295,6 +1299,14 @@ async def _filter_candidates_by_guard_proximity_async(
         return []
 
     if getattr(comparator, "prefer_guard_proximity_counts", False):
+        fast_result = await _filter_candidates_by_preferred_guard_counts_async(
+            candidates,
+            sample1,
+            guards,
+            comparator,
+        )
+        if fast_result is not None:
+            return fast_result
         if _has_index_batch_bool_comparator(comparator):
             return await _filter_candidates_by_flattened_guard_index_comparisons_async(
                 candidates,
@@ -1311,14 +1323,6 @@ async def _filter_candidates_by_guard_proximity_async(
                 comparator,
                 batch_size=batch_size,
             )
-        fast_result = await _filter_candidates_by_preferred_guard_counts_async(
-            candidates,
-            sample1,
-            guards,
-            comparator,
-        )
-        if fast_result is not None:
-            return fast_result
 
     edge_distance_matrix = _edge_distance_matrix_callback(comparator)
     if edge_distance_matrix is not None:
@@ -1382,6 +1386,52 @@ def _has_index_batch_bool_comparator(comparator: DistanceComparator) -> bool:
         or callable(getattr(comparator, "compare_index_batch_bool_async", None))
         or callable(getattr(comparator, "compare_index_batch_bool", None))
     )
+
+
+def _has_index_grouped_majority_comparator(comparator: DistanceComparator) -> bool:
+    return callable(getattr(comparator, "comparison_index_for_text", None)) and (
+        callable(getattr(comparator, "compare_index_grouped_majority_bool_async", None))
+        or callable(getattr(comparator, "compare_index_grouped_majority_bool", None))
+    )
+
+
+async def _compare_index_grouped_majority_bool_async(
+    comparator: DistanceComparator,
+    *,
+    ab_left_indexes: Any,
+    ab_right_indexes: Any,
+    cd_left_indexes: Any,
+    cd_right_indexes: Any,
+    offsets: Any,
+    invert_majority: Any,
+) -> Any:
+    compare_async = getattr(
+        comparator,
+        "compare_index_grouped_majority_bool_async",
+        None,
+    )
+    if compare_async is not None:
+        return await compare_async(
+            ab_left_indexes=ab_left_indexes,
+            ab_right_indexes=ab_right_indexes,
+            cd_left_indexes=cd_left_indexes,
+            cd_right_indexes=cd_right_indexes,
+            offsets=offsets,
+            invert_majority=invert_majority,
+        )
+
+    compare = getattr(comparator, "compare_index_grouped_majority_bool", None)
+    if compare is not None:
+        return compare(
+            ab_left_indexes=ab_left_indexes,
+            ab_right_indexes=ab_right_indexes,
+            cd_left_indexes=cd_left_indexes,
+            cd_right_indexes=cd_right_indexes,
+            offsets=offsets,
+            invert_majority=invert_majority,
+        )
+
+    raise RuntimeError("Comparator does not support indexed grouped comparisons.")
 
 
 def _index_array_to_comparison_list(comparisons: Any) -> list[IndexComparisonInput]:
@@ -1646,6 +1696,19 @@ async def _filter_candidates_by_preferred_guard_counts_async(
     guards: Mapping[str, tuple[TextRow, ...]],
     comparator: DistanceComparator,
 ) -> list[TextRow] | None:
+    guard_proximity_max_counts = getattr(
+        comparator,
+        "guard_proximity_max_counts",
+        None,
+    )
+    if callable(guard_proximity_max_counts):
+        return _filter_candidates_by_guard_proximity_max_counts(
+            candidates,
+            sample1,
+            guards,
+            guard_proximity_max_counts,
+        )
+
     guard_proximity_counts_async = getattr(
         comparator,
         "guard_proximity_counts_async",
@@ -1669,6 +1732,49 @@ async def _filter_candidates_by_preferred_guard_counts_async(
         )
 
     return None
+
+
+def _filter_candidates_by_guard_proximity_max_counts(
+    candidates: Sequence[TextRow],
+    sample1: Sequence[TextRow],
+    guards: Mapping[str, tuple[TextRow, ...]],
+    guard_proximity_max_counts: Callable[
+        [Sequence[str], Sequence[str], Sequence[Sequence[str]]],
+        Sequence[int],
+    ],
+) -> list[TextRow]:
+    candidate_ids = tuple(row.id for row in candidates)
+    active_samples = tuple(
+        (sample, guards.get(sample.id, ()))
+        for sample in sample1
+        if guards.get(sample.id)
+    )
+    if not active_samples:
+        return _filter_candidates_by_proximity(
+            candidates,
+            {row_id: 0 for row_id in candidate_ids},
+        )
+
+    counts = guard_proximity_max_counts(
+        tuple(sample.text for sample, _ in active_samples),
+        tuple(candidate.text for candidate in candidates),
+        tuple(
+            tuple(guard.text for guard in guard_rows)
+            for _, guard_rows in active_samples
+        ),
+    )
+    if len(counts) != len(candidate_ids):
+        raise RuntimeError(
+            "guard_proximity_max_counts returned an unexpected number of counts."
+        )
+
+    return _filter_candidates_by_proximity(
+        candidates,
+        {
+            row_id: int(count)
+            for row_id, count in zip(candidate_ids, counts)
+        },
+    )
 
 
 def _filter_candidates_by_guard_proximity_matrix(
@@ -1697,7 +1803,6 @@ def _filter_candidates_by_guard_proximity_matrix(
             active_samples,
             candidates,
             edge_distance_matrix,
-            mask_self_edges=False,
         )
         guard_distances = np.asarray(
             edge_distance_matrix(

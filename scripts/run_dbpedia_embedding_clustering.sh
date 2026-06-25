@@ -3,12 +3,12 @@ set -euo pipefail
 
 mkdir -p results
 
-limit=100000
+limit=10000
 
 .venv/bin/python -m llm_cluster.cli \
   --dataset dbpedia \
   --task embedding-cluster \
-  --cluster-count 226 \
+  --cluster-count 14 \
   --cluster-seed 0 \
   --candidate-limit $limit \
   --candidate-seed 0 \

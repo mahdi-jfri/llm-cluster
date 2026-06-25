@@ -23,7 +23,6 @@ from llm_cluster.embedding_clustering import (
 )
 from llm_cluster.metrics import evaluate_clustering
 from llm_cluster.weak_comparison_clustering import (
-    DEFAULT_NEAREST_EDGE_STRATEGY,
     WeakComparisonAlgGResult,
     weak_comparison_alg_g_cluster,
 )
@@ -112,52 +111,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Multiplier for the notebook Alg-G S2 sample size max(24, 8k, 80).",
     )
     parser.add_argument(
-        "--weak-comparison-window-multiplier",
-        type=float,
-        default=2.0,
-        help=(
-            "Deprecated compatibility field; the notebook implementation "
-            "uses max(12, int(1.2 * floor(log2(n_i)))) unless an explicit "
-            "debug window size is supplied."
-        ),
-    )
-    parser.add_argument(
-        "--weak-comparison-terminal-multiplier",
-        type=float,
-        default=0.01,
-        help=(
-            "Deprecated compatibility field; the notebook implementation "
-            "stops when active rows are <= 100."
-        ),
-    )
-    parser.add_argument(
-        "--weak-comparison-sample-fraction-cap",
-        type=float,
-        default=0,
-        help=(
-            "Deprecated compatibility field. Must be 0 because the notebook "
-            "implementation does not cap S1/S2 by active-row fraction."
-        ),
-    )
-    parser.add_argument(
-        "--weak-comparison-nearest-edge-strategy",
-        choices=("sort",),
-        default=DEFAULT_NEAREST_EDGE_STRATEGY,
-        help=(
-            "How Alg-G chooses S1-nearest edges for filtered rows. "
-            "'sort' preserves the notebook behavior by sorting all S1 x V' edges."
-        ),
-    )
-    parser.add_argument(
-        "--weak-comparison-window-size",
-        type=int,
-        default=None,
-        help=(
-            "Deprecated compatibility field. Leave unset because the notebook "
-            "kernel/guard size is fixed by the round size."
-        ),
-    )
-    parser.add_argument(
         "--weak-comparison-max-rounds",
         type=int,
         default=None,
@@ -226,44 +179,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Maximum KMeans iterations.",
     )
     parser.add_argument(
-        "--provider",
-        default="openrouter",
-        help="Legacy LLM comparison option; ignored by embedding comparisons.",
-    )
-    parser.add_argument(
-        "--model-name",
-        default="qwen/qwen3.5-9b",
-        help="Legacy LLM comparison option; ignored by embedding comparisons.",
-    )
-    parser.add_argument(
-        "--model-base-url",
-        default=None,
-        help="Legacy LLM comparison option; ignored by embedding comparisons.",
-    )
-    parser.add_argument(
-        "--model-api-key",
-        default=None,
-        help="Legacy LLM comparison option; ignored by embedding comparisons.",
-    )
-    parser.add_argument(
-        "--temperature",
-        type=float,
-        default=0.0,
-        help="Legacy LLM comparison option; ignored by embedding comparisons.",
-    )
-    parser.add_argument(
-        "--max-tokens",
-        type=int,
-        default=1024,
-        help="Legacy LLM comparison option; ignored by embedding comparisons.",
-    )
-    parser.add_argument(
-        "--comparison-concurrency",
-        type=int,
-        default=4,
-        help="Legacy LLM comparison option; ignored by embedding comparisons.",
-    )
-    parser.add_argument(
         "--comparison-batch-size",
         type=int,
         default=8192,
@@ -271,34 +186,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             "Number of weak-comparison embedding distance queries per "
             "vectorized NumPy batch."
         ),
-    )
-    parser.add_argument(
-        "--comparison-retries",
-        type=int,
-        default=2,
-        help="Legacy LLM comparison option; ignored by embedding comparisons.",
-    )
-    parser.add_argument(
-        "--comparison-cache-path",
-        default=".cache/llm-cluster/comparisons.sqlite",
-        help="Legacy LLM comparison option; ignored by embedding comparisons.",
-    )
-    parser.add_argument(
-        "--comparison-cache-sync-interval",
-        type=float,
-        default=5.0,
-        help="Legacy LLM comparison option; ignored by embedding comparisons.",
-    )
-    parser.add_argument(
-        "--comparison-cache-flush-size",
-        type=int,
-        default=1000,
-        help="Legacy LLM comparison option; ignored by embedding comparisons.",
-    )
-    parser.add_argument(
-        "--no-comparison-cache",
-        action="store_true",
-        help="Legacy LLM comparison option; ignored by embedding comparisons.",
     )
     parser.add_argument(
         "--progress-interval",
@@ -334,22 +221,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.weak_comparison_sample2_multiplier <= 0:
             raise ValueError(
                 "--weak-comparison-sample2-multiplier must be positive."
-            )
-        if args.weak_comparison_window_multiplier <= 0:
-            raise ValueError("--weak-comparison-window-multiplier must be positive.")
-        if args.weak_comparison_terminal_multiplier < 0:
-            raise ValueError(
-                "--weak-comparison-terminal-multiplier must be non-negative."
-            )
-        if args.weak_comparison_sample_fraction_cap != 0:
-            raise ValueError(
-                "--weak-comparison-sample-fraction-cap must be 0 for the "
-                "notebook implementation."
-            )
-        if args.weak_comparison_window_size is not None:
-            raise ValueError(
-                "--weak-comparison-window-size is not supported by the "
-                "notebook implementation."
             )
         if (
             args.weak_comparison_max_rounds is not None
@@ -483,8 +354,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "ranked_rows": [_row_to_dict(row) for row in ranked_rows],
             }
         elif args.task == "cluster":
-            if args.cluster_count is None:
-                raise RuntimeError("Clustering task did not receive --cluster-count.")
             final_center_count = (
                 None if args.no_cluster_exact_k else args.cluster_count
             )
@@ -505,8 +374,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 clustering=clustering,
             )
         else:
-            if args.cluster_count is None:
-                raise RuntimeError("Clustering task did not receive --cluster-count.")
             final_center_count = (
                 None if args.no_cluster_exact_k else args.cluster_count
             )
@@ -517,17 +384,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 correctness_probability=args.weak_comparison_correctness_probability,
                 sample1_multiplier=args.weak_comparison_sample1_multiplier,
                 sample2_multiplier=args.weak_comparison_sample2_multiplier,
-                window_multiplier=args.weak_comparison_window_multiplier,
-                terminal_multiplier=args.weak_comparison_terminal_multiplier,
-                sample_fraction_cap=(
-                    None
-                    if args.weak_comparison_sample_fraction_cap == 0
-                    else args.weak_comparison_sample_fraction_cap
-                ),
-                nearest_edge_strategy=args.weak_comparison_nearest_edge_strategy,
                 seed=args.cluster_seed,
                 final_center_count=final_center_count,
-                window_size=args.weak_comparison_window_size,
                 max_rounds=args.weak_comparison_max_rounds,
                 comparison_batch_size=args.comparison_batch_size,
             )
@@ -539,8 +397,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 clustering=clustering,
             )
     else:
-        if args.cluster_count is None:
-            raise RuntimeError("Clustering task did not receive --cluster-count.")
         if args.cluster_count > len(cluster_rows):
             raise ValueError(
                 "--cluster-count must be <= selected rows for "

@@ -22,13 +22,12 @@ PY
 embedding_device="${EMBEDDING_DEVICE:-${detected_device}}"
 comparison_device="${COMPARISON_DEVICE:-${embedding_device}}"
 
-limit=10000
+limit=100000
 echo "Running DBpedia weak-comparison clustering with embedding_device=${embedding_device} comparison_device=${comparison_device}" >&2
 
 "${python_bin}" -m llm_cluster.cli \
   --dataset dbpedia \
   --task weak-comparison-cluster \
-  --no-cluster-exact-k \
   --cluster-count 14 \
   --cluster-seed 0 \
   --candidate-limit $limit \

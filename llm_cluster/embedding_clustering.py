@@ -193,6 +193,73 @@ class EmbeddingDistanceComparator:
         self._notify_progress(len(indexes))
         return ab_distances < cd_distances
 
+    def compare_index_grouped_majority_bool(
+        self,
+        *,
+        ab_left_indexes: Any,
+        ab_right_indexes: Any,
+        cd_left_indexes: Any,
+        cd_right_indexes: Any,
+        offsets: Any,
+        invert_majority: Any,
+    ) -> Any:
+        import numpy as np
+
+        ab_left_indexes = np.asarray(ab_left_indexes, dtype=np.int64)
+        ab_right_indexes = np.asarray(ab_right_indexes, dtype=np.int64)
+        cd_left_indexes = np.asarray(cd_left_indexes, dtype=np.int64)
+        cd_right_indexes = np.asarray(cd_right_indexes, dtype=np.int64)
+        offsets = np.asarray(offsets, dtype=np.int64)
+        invert_majority = np.asarray(invert_majority, dtype=bool)
+
+        group_count = len(ab_left_indexes)
+        if (
+            len(ab_right_indexes) != group_count
+            or len(cd_right_indexes) != group_count
+            or len(invert_majority) != group_count
+            or len(offsets) != group_count + 1
+        ):
+            raise ValueError("Grouped comparison arrays have inconsistent lengths.")
+        if group_count == 0:
+            return np.empty(0, dtype=bool)
+        if offsets[0] != 0 or offsets[-1] != len(cd_left_indexes):
+            raise ValueError("Grouped comparison offsets do not match cd_left_indexes.")
+
+        if self._comparison_backend == "torch":
+            answers = self._comparison_grouped_majority_by_index_torch(
+                ab_left_indexes=ab_left_indexes,
+                ab_right_indexes=ab_right_indexes,
+                cd_left_indexes=cd_left_indexes,
+                cd_right_indexes=cd_right_indexes,
+                offsets=offsets,
+                invert_majority=invert_majority,
+            )
+            self._notify_progress(len(cd_left_indexes))
+            return answers
+
+        lengths = offsets[1:] - offsets[:-1]
+        group_ids = np.repeat(np.arange(group_count), lengths)
+        if len(cd_left_indexes) == 0:
+            not_smaller_count = np.zeros(group_count, dtype=np.int64)
+        else:
+            ab_distances = self._pair_distances_by_index(
+                ab_left_indexes[group_ids],
+                ab_right_indexes[group_ids],
+            )
+            cd_distances = self._pair_distances_by_index(
+                cd_left_indexes,
+                cd_right_indexes[group_ids],
+            )
+            answers = ab_distances < cd_distances
+            prefix = np.empty(len(answers) + 1, dtype=np.int64)
+            prefix[0] = 0
+            np.cumsum(~answers, out=prefix[1:])
+            not_smaller_count = prefix[offsets[1:]] - prefix[offsets[:-1]]
+
+        majority_not_smaller = not_smaller_count > (lengths // 2)
+        self._notify_progress(len(cd_left_indexes))
+        return np.where(invert_majority, ~majority_not_smaller, majority_not_smaller)
+
     def pair_distances(
         self,
         left_texts: Sequence[str],
@@ -263,6 +330,47 @@ class EmbeddingDistanceComparator:
         )
 
         return [int(count) for count in counts]
+
+    def guard_proximity_max_counts(
+        self,
+        sample_texts: Sequence[str],
+        candidate_texts: Sequence[str],
+        guard_text_groups: Sequence[Sequence[str]],
+    ) -> list[int]:
+        if len(sample_texts) != len(guard_text_groups):
+            raise ValueError(
+                "sample_texts and guard_text_groups must have the same length."
+            )
+        if not candidate_texts:
+            return []
+
+        if self._comparison_backend == "torch":
+            counts = self._guard_proximity_max_counts_by_torch(
+                sample_texts,
+                candidate_texts,
+                guard_text_groups,
+            )
+            self._notify_progress(
+                sum(
+                    len(candidate_texts) * len(guard_texts)
+                    for guard_texts in guard_text_groups
+                    if guard_texts
+                )
+            )
+            return counts
+
+        prox_max = [0] * len(candidate_texts)
+        for sample_text, guard_texts in zip(sample_texts, guard_text_groups):
+            counts = self.guard_proximity_counts(
+                sample_text,
+                candidate_texts,
+                guard_texts,
+            )
+            prox_max = [
+                max(current, int(count))
+                for current, count in zip(prox_max, counts)
+            ]
+        return prox_max
 
     async def compare_batch_async(
         self,
@@ -408,6 +516,67 @@ class EmbeddingDistanceComparator:
         )
         return (ab_distances < cd_distances).detach().cpu().numpy()
 
+    def _comparison_grouped_majority_by_index_torch(
+        self,
+        *,
+        ab_left_indexes: Any,
+        ab_right_indexes: Any,
+        cd_left_indexes: Any,
+        cd_right_indexes: Any,
+        offsets: Any,
+        invert_majority: Any,
+    ) -> Any:
+        import torch
+
+        group_count = len(ab_left_indexes)
+        ab_left = self._torch_indexes(ab_left_indexes)
+        ab_right = self._torch_indexes(ab_right_indexes)
+        cd_left = self._torch_indexes(cd_left_indexes)
+        cd_right = self._torch_indexes(cd_right_indexes)
+        offsets_tensor = self._torch_indexes(offsets)
+        lengths = offsets_tensor[1:] - offsets_tensor[:-1]
+
+        if len(cd_left_indexes) == 0:
+            not_smaller_count = torch.zeros(
+                group_count,
+                dtype=torch.long,
+                device=self._embeddings.device,
+            )
+        else:
+            group_ids = torch.repeat_interleave(
+                torch.arange(group_count, device=self._embeddings.device),
+                lengths,
+            )
+            answers = self._pair_distances_by_torch_index_tensors(
+                ab_left[group_ids],
+                ab_right[group_ids],
+            ) < self._pair_distances_by_torch_index_tensors(
+                cd_left,
+                cd_right[group_ids],
+            )
+            prefix = torch.empty(
+                len(answers) + 1,
+                dtype=torch.long,
+                device=self._embeddings.device,
+            )
+            prefix[0] = 0
+            torch.cumsum((~answers).to(torch.long), dim=0, out=prefix[1:])
+            not_smaller_count = (
+                prefix[offsets_tensor[1:]] - prefix[offsets_tensor[:-1]]
+            )
+
+        majority_not_smaller = not_smaller_count > (lengths // 2)
+        invert = torch.as_tensor(
+            invert_majority,
+            dtype=torch.bool,
+            device=self._embeddings.device,
+        )
+        return torch.where(
+            invert,
+            ~majority_not_smaller,
+            majority_not_smaller,
+        ).detach().cpu().numpy()
+
     def _guard_proximity_counts_by_torch(
         self,
         sample_text: str,
@@ -433,6 +602,53 @@ class EmbeddingDistanceComparator:
         )
         self._notify_progress(len(candidate_texts) + len(guard_texts))
         return [int(count) for count in counts.detach().cpu().tolist()]
+
+    def _guard_proximity_max_counts_by_torch(
+        self,
+        sample_texts: Sequence[str],
+        candidate_texts: Sequence[str],
+        guard_text_groups: Sequence[Sequence[str]],
+    ) -> list[int]:
+        import torch
+
+        active_groups = [
+            (sample_text, guard_texts)
+            for sample_text, guard_texts in zip(sample_texts, guard_text_groups)
+            if guard_texts
+        ]
+        if not active_groups:
+            return [0] * len(candidate_texts)
+
+        sample_indexes = self._indexes_for_texts(
+            tuple(sample_text for sample_text, _ in active_groups)
+        )
+        candidate_indexes = self._indexes_for_texts(candidate_texts)
+        sample = self._torch_indexes(sample_indexes)
+        candidate = self._torch_indexes(candidate_indexes)
+        candidate_distances = self._distance_matrix_by_torch_index_tensors(
+            sample,
+            candidate,
+        )
+        prox_max = torch.zeros(
+            len(candidate_texts),
+            dtype=torch.long,
+            device=self._embeddings.device,
+        )
+
+        for sample_index, (_, guard_texts) in enumerate(active_groups):
+            guard = self._torch_indexes(self._indexes_for_texts(guard_texts))
+            guard_distances = self._distance_matrix_by_torch_index_tensors(
+                sample[sample_index : sample_index + 1],
+                guard,
+            )[0]
+            counts = torch.sum(
+                candidate_distances[sample_index, :, None]
+                < guard_distances[None, :],
+                dim=1,
+            )
+            prox_max = torch.maximum(prox_max, counts)
+
+        return [int(count) for count in prox_max.detach().cpu().tolist()]
 
     def _pair_distances_by_index_torch(
         self,
@@ -483,12 +699,19 @@ class EmbeddingDistanceComparator:
 
         left = self._torch_indexes(left_indexes)
         right = self._torch_indexes(right_indexes)
+        return self._distance_matrix_by_torch_index_tensors(left, right)
+
+    def _distance_matrix_by_torch_index_tensors(
+        self,
+        left: Any,
+        right: Any,
+    ) -> Any:
         distances = (
             self._embedding_norms[left, None]
             + self._embedding_norms[right][None, :]
             - 2.0 * (self._embeddings[left] @ self._embeddings[right].T)
         )
-        return torch.clamp_min(distances, 0.0)
+        return distances.clamp_min(0.0)
 
     def _torch_indexes(self, indexes: Any) -> Any:
         import torch

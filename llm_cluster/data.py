@@ -66,9 +66,8 @@ def load_clinc(
                 label_field=None,
                 remove_label_names=remove_labels,
             )
-        except (
-            Exception
-        ) as exc:  # pragma: no cover - fallback path depends on HF state.
+        except Exception as exc:  # pragma: no cover
+            # Fallback path depends on Hugging Face dataset availability.
             errors.append(f"{candidate_id}: {exc}")
 
     joined_errors = "\n".join(errors)
@@ -96,9 +95,8 @@ def load_dbpedia(
                 text_fields=("title", "content"),
                 label_field="label",
             )
-        except (
-            Exception
-        ) as exc:  # pragma: no cover - fallback path depends on HF state.
+        except Exception as exc:  # pragma: no cover
+            # Fallback path depends on Hugging Face dataset availability.
             errors.append(f"{candidate_id}: {exc}")
 
     joined_errors = "\n".join(errors)
@@ -166,7 +164,6 @@ def load_hf_text_classification_dataset(
             for key, value in item.items()
             if key not in {*resolved_text_fields, resolved_label_field}
         }
-        text_metadata: dict[str, Any]
         if len(resolved_text_fields) == 1:
             text_metadata = {"text_field": resolved_text_fields[0]}
         else:
@@ -195,11 +192,14 @@ def load_hf_text_classification_dataset(
 
 
 def _join_text_fields(item: Mapping[str, Any], fields: Sequence[str]) -> str:
-    parts = [
-        str(item[field]).strip()
-        for field in fields
-        if item.get(field) is not None and str(item[field]).strip()
-    ]
+    parts: list[str] = []
+    for field in fields:
+        value = item.get(field)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            parts.append(text)
     return "\n\n".join(parts)
 
 
