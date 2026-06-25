@@ -10,6 +10,9 @@ CLINC_DATASET_IDS = (
 )
 CLINC_DEFAULT_CONFIG = "plus"
 
+DBPEDIA_DATASET_IDS = ("fancyzhx/dbpedia_14",)
+DBPEDIA_DEFAULT_SPLIT = "train"
+
 
 @dataclass(frozen=True)
 class TextRow:
@@ -28,13 +31,15 @@ def load_dataset_rows(name: str, **kwargs: Any) -> list[TextRow]:
     normalized = name.lower().replace("-", "_")
     if normalized in {"clinc", "clinc150", "clinc_150", "clinc_oos"}:
         return load_clinc(**kwargs)
+    if normalized in {"dbpedia", "dbpedia_14", "dbpedia_ontology"}:
+        return load_dbpedia(**kwargs)
 
     raise ValueError(f"Unsupported dataset: {name!r}")
 
 
 def load_clinc(
     *,
-    split: str = "test",
+    split: str | None = "test",
     config: str | None = CLINC_DEFAULT_CONFIG,
     dataset_id: str | None = None,
     remove_oos: bool = True,
@@ -45,6 +50,8 @@ def load_clinc(
     should yield the 4,500 in-scope test queries used by prior clustering work.
     """
 
+    split = split or "test"
+    config = CLINC_DEFAULT_CONFIG if config is None else config
     remove_labels = {"oos", "out_of_scope", "out-of-scope"} if remove_oos else set()
     dataset_ids = (dataset_id,) if dataset_id else CLINC_DATASET_IDS
     errors: list[str] = []
@@ -68,12 +75,43 @@ def load_clinc(
     raise RuntimeError(f"Failed to load CLINC dataset.\n{joined_errors}")
 
 
+def load_dbpedia(
+    *,
+    split: str | None = DBPEDIA_DEFAULT_SPLIT,
+    config: str | None = None,
+    dataset_id: str | None = None,
+) -> list[TextRow]:
+    """Load DBpedia Ontology rows from the 14-class DBpedia article dataset."""
+
+    split = split or DBPEDIA_DEFAULT_SPLIT
+    dataset_ids = (dataset_id,) if dataset_id else DBPEDIA_DATASET_IDS
+    errors: list[str] = []
+
+    for candidate_id in dataset_ids:
+        try:
+            return load_hf_text_classification_dataset(
+                dataset_id=candidate_id,
+                config=config,
+                split=split,
+                text_fields=("title", "content"),
+                label_field="label",
+            )
+        except (
+            Exception
+        ) as exc:  # pragma: no cover - fallback path depends on HF state.
+            errors.append(f"{candidate_id}: {exc}")
+
+    joined_errors = "\n".join(errors)
+    raise RuntimeError(f"Failed to load DBpedia dataset.\n{joined_errors}")
+
+
 def load_hf_text_classification_dataset(
     *,
     dataset_id: str,
     split: str,
     config: str | None = None,
     text_field: str | None = None,
+    text_fields: Sequence[str] | None = None,
     label_field: str | None = None,
     remove_label_names: Iterable[str] = (),
 ) -> list[TextRow]:
@@ -81,12 +119,32 @@ def load_hf_text_classification_dataset(
 
     from datasets import load_dataset as hf_load_dataset
 
+    if text_field is not None and text_fields is not None:
+        raise ValueError("Specify only one of text_field or text_fields.")
+
     raw_dataset = hf_load_dataset(dataset_id, config, split=split)
     features = raw_dataset.features
 
-    resolved_text_field = text_field or _infer_field(
-        features.keys(), ("text", "sentence", "query", "utterance"), "text"
-    )
+    if text_fields is not None:
+        resolved_text_fields = tuple(text_fields)
+        if not resolved_text_fields:
+            raise ValueError("text_fields must contain at least one field.")
+        missing_text_fields = [
+            field for field in resolved_text_fields if field not in features
+        ]
+        if missing_text_fields:
+            field_list = ", ".join(features.keys())
+            missing = ", ".join(missing_text_fields)
+            raise ValueError(
+                f"Missing text field(s) {missing} from available fields: {field_list}"
+            )
+    else:
+        resolved_text_fields = (
+            text_field
+            or _infer_field(
+                features.keys(), ("text", "sentence", "query", "utterance"), "text"
+            ),
+        )
     resolved_label_field = label_field or _infer_field(
         features.keys(), ("intent", "label", "category"), "label"
     )
@@ -97,7 +155,7 @@ def load_hf_text_classification_dataset(
 
     rows: list[TextRow] = []
     for index, item in enumerate(raw_dataset):
-        text = str(item[resolved_text_field])
+        text = _join_text_fields(item, resolved_text_fields)
         label = item[resolved_label_field]
         label_name = _resolve_label_name(label, label_names)
         if _normalize_label_name(label_name) in remove_labels:
@@ -106,14 +164,20 @@ def load_hf_text_classification_dataset(
         metadata = {
             key: value
             for key, value in item.items()
-            if key not in {resolved_text_field, resolved_label_field}
+            if key not in {*resolved_text_fields, resolved_label_field}
         }
+        text_metadata: dict[str, Any]
+        if len(resolved_text_fields) == 1:
+            text_metadata = {"text_field": resolved_text_fields[0]}
+        else:
+            text_metadata = {"text_fields": list(resolved_text_fields)}
         metadata.update(
             {
                 "dataset_id": dataset_id,
+                "config": config,
                 "split": split,
-                "text_field": resolved_text_field,
                 "label_field": resolved_label_field,
+                **text_metadata,
             }
         )
 
@@ -128,6 +192,15 @@ def load_hf_text_classification_dataset(
         )
 
     return rows
+
+
+def _join_text_fields(item: Mapping[str, Any], fields: Sequence[str]) -> str:
+    parts = [
+        str(item[field]).strip()
+        for field in fields
+        if item.get(field) is not None and str(item[field]).strip()
+    ]
+    return "\n\n".join(parts)
 
 
 def _infer_field(fields: Sequence[str], candidates: Sequence[str], kind: str) -> str:
