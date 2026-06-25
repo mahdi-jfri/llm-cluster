@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 
 from llm_cluster.clustering import TextCluster
 from llm_cluster.comparison import (
@@ -17,6 +17,7 @@ DBPEDIA_ONTOLOGY_INSTRUCTOR_PROMPT = (
     "Represent Wikipedia articles for ontology classification: "
 )
 DEFAULT_KMEANS_INIT = "k-means++"
+EMBEDDING_NUMPY_DTYPE = "float16"
 
 
 @dataclass(frozen=True)
@@ -48,15 +49,18 @@ class EmbeddingDistanceComparator:
     batch_size: int = 64
     normalize_embeddings: bool = True
     device: str | None = None
+    comparison_device: str | None = None
     show_progress_bar: bool = False
     progress_callback: ComparisonProgressCallback | None = None
     n_source_rows: int = field(init=False)
     n_unique_texts: int = field(init=False)
     embedding_shape: tuple[int, int] = field(init=False)
+    resolved_comparison_device: str = field(init=False)
+    prefer_guard_proximity_counts: bool = field(init=False)
     _text_to_index: dict[str, int] = field(init=False, repr=False)
     _embeddings: Any = field(init=False, repr=False)
     _embedding_norms: Any = field(init=False, repr=False)
-    _distance_matrix: Any = field(init=False, repr=False)
+    _comparison_backend: str = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.batch_size < 1:
@@ -68,34 +72,55 @@ class EmbeddingDistanceComparator:
 
         unique_rows = _unique_rows_by_text(source_rows)
         model = _load_instructor_model(self.model_name, device=self.device)
-        embeddings = _encode_instructor_embeddings(
-            model,
-            unique_rows,
-            prompt=self.prompt,
-            batch_size=self.batch_size,
-            normalize_embeddings=self.normalize_embeddings,
-            show_progress_bar=self.show_progress_bar,
+        _use_float16_model(model, requested_device=self.device)
+        try:
+            embeddings = _encode_instructor_embeddings(
+                model,
+                unique_rows,
+                prompt=self.prompt,
+                batch_size=self.batch_size,
+                normalize_embeddings=self.normalize_embeddings,
+                show_progress_bar=self.show_progress_bar,
+            )
+        finally:
+            should_clear_cuda_cache = _model_uses_cuda(model, self.device)
+            del model
+            if should_clear_cuda_cache:
+                _empty_torch_cuda_cache()
+
+        embeddings = _as_embedding_array(embeddings)
+        comparison_device = _resolve_comparison_device(
+            self.comparison_device,
+            fallback_device=self.device,
         )
-
-        import numpy as np
-
-        embeddings = np.ascontiguousarray(embeddings)
+        comparison_backend = _comparison_backend_for_device(comparison_device)
+        embeddings, embedding_norms = _prepare_comparison_arrays(
+            embeddings,
+            device=comparison_device,
+            backend=comparison_backend,
+        )
 
         self.n_source_rows = len(source_rows)
         self.n_unique_texts = len(unique_rows)
         self.embedding_shape = (int(embeddings.shape[0]), int(embeddings.shape[1]))
+        self.resolved_comparison_device = comparison_device
+        self.prefer_guard_proximity_counts = comparison_backend == "torch"
         self._text_to_index = {
             row.text: index for index, row in enumerate(unique_rows)
         }
         self._embeddings = embeddings
-        self._embedding_norms = np.einsum("ij,ij->i", embeddings, embeddings)
-        self._distance_matrix = _squared_l2_distance_matrix(
-            embeddings,
-            self._embedding_norms,
-        )
+        self._embedding_norms = embedding_norms
+        self._comparison_backend = comparison_backend
 
     def compare(self, a: str, b: str, c: str, d: str) -> ComparisonResult:
         return self.compare_batch([(a, b, c, d)])[0]
+
+    @property
+    def comparison_backend(self) -> str:
+        return self._comparison_backend
+
+    def comparison_index_for_text(self, text: str) -> int:
+        return self._index_for_text(text)
 
     def compare_batch(
         self,
@@ -131,8 +156,41 @@ class EmbeddingDistanceComparator:
 
             return np.empty(0, dtype=bool)
 
+        if self._comparison_backend == "torch":
+            answers = self._comparison_answers_by_torch(comparisons)
+            self._notify_progress(len(comparisons))
+            return answers
+
         ab_distances, cd_distances = self._comparison_distances(comparisons)
         self._notify_progress(len(comparisons))
+        return ab_distances < cd_distances
+
+    def compare_index_batch_bool(
+        self,
+        comparisons: Sequence[tuple[int, int, int, int]],
+    ) -> Any:
+        """Return boolean answers for pre-indexed embedding comparisons."""
+
+        indexes = self._index_comparison_array(comparisons)
+        return self.compare_index_array_bool(indexes)
+
+    def compare_index_array_bool(self, indexes: Any) -> Any:
+        """Return boolean answers for an int64 ``(n, 4)`` comparison array."""
+
+        import numpy as np
+
+        indexes = self._index_comparison_array(indexes)
+        if len(indexes) == 0:
+            return np.empty(0, dtype=bool)
+
+        if self._comparison_backend == "torch":
+            answers = self._comparison_answers_by_index_array_torch(indexes)
+            self._notify_progress(len(indexes))
+            return answers
+
+        ab_distances = self._pair_distances_by_index(indexes[:, 0], indexes[:, 1])
+        cd_distances = self._pair_distances_by_index(indexes[:, 2], indexes[:, 3])
+        self._notify_progress(len(indexes))
         return ab_distances < cd_distances
 
     def pair_distances(
@@ -181,6 +239,13 @@ class EmbeddingDistanceComparator:
             return []
         if not guard_texts:
             return [0] * len(candidate_texts)
+
+        if self._comparison_backend == "torch":
+            return self._guard_proximity_counts_by_torch(
+                sample_text,
+                candidate_texts,
+                guard_texts,
+            )
 
         import numpy as np
 
@@ -241,15 +306,57 @@ class EmbeddingDistanceComparator:
         cd_distances = self._pair_distances_by_index(indexes[:, 2], indexes[:, 3])
         return ab_distances, cd_distances
 
+    def _index_comparison_array(self, indexes: Any) -> Any:
+        import numpy as np
+
+        if isinstance(indexes, np.ndarray) and indexes.dtype == np.int64:
+            array = indexes
+        else:
+            array = np.asarray(indexes, dtype=np.int64)
+
+        if array.size == 0:
+            return np.empty((0, 4), dtype=np.int64)
+        if array.ndim != 2 or array.shape[1] != 4:
+            raise ValueError(
+                "Indexed comparisons must be a two-dimensional array with "
+                "shape (n, 4)."
+            )
+        return array
+
     def _pair_distances_by_index(self, left_indexes: Any, right_indexes: Any) -> Any:
+        if self._comparison_backend == "torch":
+            distances = self._pair_distances_by_index_torch(
+                left_indexes,
+                right_indexes,
+            )
+            return distances.detach().cpu().numpy()
+
         import numpy as np
 
         if len(left_indexes) == 0:
             return np.empty(0, dtype=self._embeddings.dtype)
 
-        return self._distance_matrix[left_indexes, right_indexes]
+        distances = (
+            self._embedding_norms[left_indexes]
+            + self._embedding_norms[right_indexes]
+            - 2.0
+            * np.einsum(
+                "ij,ij->i",
+                self._embeddings[left_indexes],
+                self._embeddings[right_indexes],
+            )
+        )
+        np.maximum(distances, 0.0, out=distances)
+        return distances
 
     def _distance_matrix_by_index(self, left_indexes: Any, right_indexes: Any) -> Any:
+        if self._comparison_backend == "torch":
+            distances = self._distance_matrix_by_index_torch(
+                left_indexes,
+                right_indexes,
+            )
+            return distances.detach().cpu().numpy()
+
         import numpy as np
 
         left_count = len(left_indexes)
@@ -260,7 +367,137 @@ class EmbeddingDistanceComparator:
                 dtype=self._embeddings.dtype,
             )
 
-        return self._distance_matrix[np.ix_(left_indexes, right_indexes)]
+        distances = (
+            self._embedding_norms[left_indexes, None]
+            + self._embedding_norms[right_indexes][None, :]
+            - 2.0
+            * (self._embeddings[left_indexes] @ self._embeddings[right_indexes].T)
+        )
+        np.maximum(distances, 0.0, out=distances)
+        return distances
+
+    def _comparison_answers_by_torch(
+        self,
+        comparisons: list[ComparisonInput],
+    ) -> Any:
+        import numpy as np
+
+        indexes = np.asarray(
+            [
+                [self._index_for_text(text) for text in comparison]
+                for comparison in comparisons
+            ],
+            dtype=np.int64,
+        )
+        return self._comparison_answers_by_index_array_torch(indexes)
+
+    def _comparison_answers_by_index_array_torch(self, indexes: Any) -> Any:
+        import numpy as np
+
+        if len(indexes) == 0:
+            return np.empty(0, dtype=bool)
+
+        index_tensor = self._torch_indexes(indexes)
+        ab_distances = self._pair_distances_by_torch_index_tensors(
+            index_tensor[:, 0],
+            index_tensor[:, 1],
+        )
+        cd_distances = self._pair_distances_by_torch_index_tensors(
+            index_tensor[:, 2],
+            index_tensor[:, 3],
+        )
+        return (ab_distances < cd_distances).detach().cpu().numpy()
+
+    def _guard_proximity_counts_by_torch(
+        self,
+        sample_text: str,
+        candidate_texts: Sequence[str],
+        guard_texts: Sequence[str],
+    ) -> list[int]:
+        import torch
+
+        sample_index = [self._index_for_text(sample_text)]
+        candidate_indexes = self._indexes_for_texts(candidate_texts)
+        guard_indexes = self._indexes_for_texts(guard_texts)
+        candidate_distances = self._distance_matrix_by_index_torch(
+            sample_index,
+            candidate_indexes,
+        )[0]
+        guard_distances = self._distance_matrix_by_index_torch(
+            sample_index,
+            guard_indexes,
+        )[0]
+        counts = torch.sum(
+            candidate_distances[:, None] < guard_distances[None, :],
+            dim=1,
+        )
+        self._notify_progress(len(candidate_texts) + len(guard_texts))
+        return [int(count) for count in counts.detach().cpu().tolist()]
+
+    def _pair_distances_by_index_torch(
+        self,
+        left_indexes: Any,
+        right_indexes: Any,
+    ) -> Any:
+        import torch
+
+        if len(left_indexes) == 0:
+            return torch.empty(
+                0,
+                dtype=self._embeddings.dtype,
+                device=self._embeddings.device,
+            )
+
+        left = self._torch_indexes(left_indexes)
+        right = self._torch_indexes(right_indexes)
+        return self._pair_distances_by_torch_index_tensors(left, right)
+
+    def _pair_distances_by_torch_index_tensors(
+        self,
+        left: Any,
+        right: Any,
+    ) -> Any:
+        distances = (
+            self._embedding_norms[left]
+            + self._embedding_norms[right]
+            - 2.0
+            * (self._embeddings[left] * self._embeddings[right]).sum(dim=1)
+        )
+        return distances.clamp_min(0.0)
+
+    def _distance_matrix_by_index_torch(
+        self,
+        left_indexes: Any,
+        right_indexes: Any,
+    ) -> Any:
+        import torch
+
+        left_count = len(left_indexes)
+        right_count = len(right_indexes)
+        if left_count == 0 or right_count == 0:
+            return torch.empty(
+                (left_count, right_count),
+                dtype=self._embeddings.dtype,
+                device=self._embeddings.device,
+            )
+
+        left = self._torch_indexes(left_indexes)
+        right = self._torch_indexes(right_indexes)
+        distances = (
+            self._embedding_norms[left, None]
+            + self._embedding_norms[right][None, :]
+            - 2.0 * (self._embeddings[left] @ self._embeddings[right].T)
+        )
+        return torch.clamp_min(distances, 0.0)
+
+    def _torch_indexes(self, indexes: Any) -> Any:
+        import torch
+
+        return torch.as_tensor(
+            indexes,
+            dtype=torch.long,
+            device=self._embeddings.device,
+        )
 
     def _notify_progress(self, count: int) -> None:
         if self.progress_callback is None:
@@ -311,14 +548,21 @@ def embedding_kmeans_cluster(
         raise ValueError(f"k must be <= number of rows ({len(all_rows)}).")
 
     model = _load_instructor_model(model_name, device=device)
-    embeddings = _encode_instructor_embeddings(
-        model,
-        all_rows,
-        prompt=prompt,
-        batch_size=batch_size,
-        normalize_embeddings=normalize_embeddings,
-        show_progress_bar=show_progress_bar,
-    )
+    _use_float16_model(model, requested_device=device)
+    try:
+        embeddings = _encode_instructor_embeddings(
+            model,
+            all_rows,
+            prompt=prompt,
+            batch_size=batch_size,
+            normalize_embeddings=normalize_embeddings,
+            show_progress_bar=show_progress_bar,
+        )
+    finally:
+        should_clear_cuda_cache = _model_uses_cuda(model, device)
+        del model
+        if should_clear_cuda_cache:
+            _empty_torch_cuda_cache()
     labels, centroids, inertia = _fit_kmeans(
         embeddings,
         k=k,
@@ -364,13 +608,95 @@ def _unique_rows_by_text(rows: Sequence[TextRow]) -> list[TextRow]:
     return list(rows_by_text.values())
 
 
-def _squared_l2_distance_matrix(embeddings: Any, norms: Any) -> Any:
-    import numpy as np
+def _resolve_comparison_device(
+    requested_device: str | None,
+    *,
+    fallback_device: str | None,
+) -> str:
+    device = requested_device if requested_device is not None else fallback_device
+    if device is None:
+        return "cpu"
+    if device == "auto":
+        try:
+            import torch
+        except ImportError:
+            return "cpu"
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    return device
 
-    distances = norms[:, None] + norms[None, :] - 2.0 * (embeddings @ embeddings.T)
-    np.maximum(distances, 0.0, out=distances)
-    np.fill_diagonal(distances, 0.0)
-    return np.ascontiguousarray(distances)
+
+def _comparison_backend_for_device(device: str) -> str:
+    try:
+        import torch
+    except ImportError as exc:
+        if device == "cpu":
+            return "numpy"
+        raise RuntimeError(
+            f"Comparison device {device!r} requires torch to be installed."
+        ) from exc
+
+    torch_device = torch.device(device)
+    if torch_device.type == "cpu":
+        return "numpy"
+    if torch_device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(
+            f"Comparison device {device!r} was requested, but CUDA is not available."
+        )
+    return "torch"
+
+
+def _prepare_comparison_arrays(
+    embeddings: Any,
+    *,
+    device: str,
+    backend: str,
+) -> tuple[Any, Any]:
+    if backend == "numpy":
+        import numpy as np
+
+        array = _as_embedding_array(embeddings)
+        norms = np.asarray(
+            np.einsum("ij,ij->i", array, array),
+            dtype=np.dtype(EMBEDDING_NUMPY_DTYPE),
+        )
+        return array, norms
+    if backend == "torch":
+        import torch
+
+        tensor = torch.as_tensor(
+            embeddings,
+            dtype=torch.float16,
+            device=torch.device(device),
+        ).contiguous()
+        return tensor, torch.sum(tensor * tensor, dim=1)
+    raise ValueError(f"Unknown comparison backend: {backend!r}.")
+
+
+def _model_uses_cuda(model: Any, requested_device: str | None) -> bool:
+    if requested_device is not None and str(requested_device).startswith("cuda"):
+        return True
+    model_device = getattr(model, "device", None)
+    return model_device is not None and str(model_device).startswith("cuda")
+
+
+def _empty_torch_cuda_cache() -> None:
+    import gc
+
+    gc.collect()
+    try:
+        import torch
+    except ImportError:
+        return
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _use_float16_model(model: Any, *, requested_device: str | None) -> None:
+    if not _model_uses_cuda(model, requested_device):
+        return
+    half = getattr(model, "half", None)
+    if callable(half):
+        half()
 
 
 def _load_instructor_model(model_name: str, *, device: str | None) -> Any:
@@ -413,15 +739,25 @@ def _encode_instructor_embeddings(
         "convert_to_numpy": True,
         "normalize_embeddings": normalize_embeddings,
     }
-    try:
-        embeddings = model.encode(inputs, **encode_kwargs)
-    except TypeError as exc:
-        if "normalize_embeddings" not in str(exc):
-            raise
-        encode_kwargs.pop("normalize_embeddings")
-        embeddings = model.encode(inputs, **encode_kwargs)
+    if show_progress_bar:
+        from tqdm.auto import tqdm
 
-    array = np.asarray(embeddings, dtype=np.float32)
+        batch_count = (len(inputs) + batch_size - 1) // batch_size
+        embeddings = np.vstack(
+            [
+                _encode_instructor_batch(model, batch, encode_kwargs)
+                for batch in tqdm(
+                    _batched(inputs, batch_size),
+                    total=batch_count,
+                    desc="Embedding rows",
+                    unit="batch",
+                )
+            ]
+        )
+    else:
+        embeddings = _encode_instructor_batch(model, inputs, encode_kwargs)
+
+    array = _as_embedding_array(embeddings)
     if array.ndim != 2:
         raise RuntimeError(f"Expected a 2D embedding array, got shape {array.shape}.")
     if array.shape[0] != len(rows):
@@ -431,7 +767,28 @@ def _encode_instructor_embeddings(
         )
     if normalize_embeddings:
         array = _l2_normalize(array)
-    return array
+    return _as_embedding_array(array)
+
+
+def _encode_instructor_batch(
+    model: Any,
+    inputs: Sequence[list[str]],
+    encode_kwargs: Mapping[str, Any],
+) -> Any:
+    batch_kwargs = dict(encode_kwargs)
+    batch_kwargs["show_progress_bar"] = False
+    try:
+        return model.encode(inputs, **batch_kwargs)
+    except TypeError as exc:
+        if "normalize_embeddings" not in str(exc):
+            raise
+        batch_kwargs.pop("normalize_embeddings")
+        return model.encode(inputs, **batch_kwargs)
+
+
+def _batched(items: Sequence[Any], batch_size: int) -> Iterator[Sequence[Any]]:
+    for start in range(0, len(items), batch_size):
+        yield items[start : start + batch_size]
 
 
 def _fit_kmeans(
@@ -458,8 +815,10 @@ def _fit_kmeans(
         n_init=n_init,
         max_iter=max_iter,
     )
+    embeddings = _as_embedding_array(embeddings)
     labels = estimator.fit_predict(embeddings)
-    return labels, estimator.cluster_centers_, float(estimator.inertia_)
+    centroids = _as_embedding_array(estimator.cluster_centers_)
+    return labels, centroids, float(estimator.inertia_)
 
 
 def _nearest_rows_to_centroids(
@@ -470,11 +829,14 @@ def _nearest_rows_to_centroids(
 ) -> dict[int, TextRow]:
     import numpy as np
 
+    embeddings = _as_embedding_array(embeddings)
+    centroids = _as_embedding_array(centroids)
     labels_array = np.asarray(labels)
     center_by_label: dict[int, TextRow] = {}
     for label in sorted(int(value) for value in set(labels_array.tolist())):
         indexes = np.flatnonzero(labels_array == label)
-        distances = np.sum((embeddings[indexes] - centroids[label]) ** 2, axis=1)
+        diff = embeddings[indexes] - centroids[label]
+        distances = np.sum(diff * diff, axis=1, dtype=embeddings.dtype)
         best_index = int(indexes[int(np.argmin(distances))])
         center_by_label[label] = rows[best_index]
     return center_by_label
@@ -504,6 +866,14 @@ def _build_clusters_from_labels(
 def _l2_normalize(embeddings: Any) -> Any:
     import numpy as np
 
+    embeddings = _as_embedding_array(embeddings)
     norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-    norms = np.maximum(norms, 1e-12)
-    return embeddings / norms
+    eps = np.asarray(np.finfo(embeddings.dtype).tiny, dtype=embeddings.dtype)
+    np.maximum(norms, eps, out=norms)
+    return np.asarray(embeddings / norms, dtype=embeddings.dtype)
+
+
+def _as_embedding_array(values: Any) -> Any:
+    import numpy as np
+
+    return np.ascontiguousarray(values, dtype=np.dtype(EMBEDDING_NUMPY_DTYPE))

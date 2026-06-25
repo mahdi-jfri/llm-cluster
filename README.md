@@ -101,6 +101,9 @@ uses guard/kernel filtering and Alg-Tester majority comparisons under the weak
 comparison oracle assumption that each persistent quadruplet answer is correct
 with probability `p > 0.75`. In this implementation, each quadruplet answer is
 computed from INSTRUCTOR embedding distances rather than queried from an LLM.
+Use `--comparison-device cuda` or `--comparison-device auto` to keep the stored
+embeddings on a torch device for batched distance comparisons after encoding;
+the default follows `--embedding-device` when it is set, otherwise it uses CPU.
 
 ```bash
 .venv/bin/python -m llm_cluster.cli \
@@ -120,20 +123,16 @@ comparison oracle. Use `--no-cluster-exact-k` to return the raw Coreset+
 mapping instead. The JSON includes both `metrics` for the final clusters and
 `coreset_metrics` for the raw Coreset+ clusters.
 
-Alg-G references `ProbSort` and `AdvSort` as external primitives, so this code
-uses local comparison-sort helpers with bounded comparison batches. The
-`--weak-comparison-nearest-edge-strategy` knob controls the expensive
-S1-nearest edge step: `sort` preserves the notebook behavior by sorting all
-S1 x V' edges, while `pick-mins` first picks the minimum S1 edge per filtered
-row and then sorts only those minima for the safe prefix. The notebook kernel
-size is `max(12, int(1.2 * floor(log2(n_i))))`, and the notebook stopping
-threshold is 100 active rows.
+The sampled S1 x S2 edge order uses a local quick-sort helper with bounded
+comparison batches. The S1-nearest edge step sorts all S1 x V' edges before
+taking the first edge per filtered row. The notebook kernel size is
+`max(12, int(1.2 * floor(log2(n_i))))`, and the notebook stopping threshold is
+100 active rows.
 
-For a full CLINC run with exact-k compression and the `pick-mins` nearest-edge
-strategy:
+For a full CLINC run with exact-k compression:
 
 ```bash
-scripts/run_vllm_qwen3_8b_weak_comparison_pick_mins.sh
+scripts/run_vllm_qwen3_8b_weak_comparison_clustering.sh
 ```
 
 ## Run CLINC Embedding Clustering
@@ -194,6 +193,17 @@ the default prompt:
 ```python
 prompt = "Represent Wikipedia articles for ontology classification: "
 ```
+
+Fixed DBpedia scripts are available:
+
+```bash
+scripts/run_dbpedia_weak_comparison_clustering.sh
+scripts/run_dbpedia_embedding_clustering.sh
+```
+
+The weak-comparison DBpedia script selects CUDA when PyTorch can see a GPU and
+falls back to CPU otherwise. Override with `EMBEDDING_DEVICE`,
+`COMPARISON_DEVICE`, or `CPU_THREADS` when running on a scheduler.
 
 ## Sources
 

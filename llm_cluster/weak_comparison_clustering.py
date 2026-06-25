@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections import deque
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
-from dataclasses import dataclass
-from itertools import islice
+from dataclasses import dataclass, field
 import math
 import random
 import sys
@@ -21,17 +19,18 @@ EdgeComparisonBatch = Callable[
     Awaitable[list[bool]],
 ]
 EdgeDistanceMatrix = Callable[[Sequence[str], Sequence[str]], Any]
+IndexComparisonInput = tuple[int, int, int, int]
+IndexAlgTestSpec = tuple[int, int, tuple[int, ...], int, bool]
 _T = TypeVar("_T")
 
 DEFAULT_DELTA = 5
-DEFAULT_PROB_SORT_D = 5
 DEFAULT_ORACLE_COMPARISON_BATCH_SIZE = 8192
 NOTEBOOK_RECURSION_LIMIT = 10_000_000
 TERMINAL_THRESHOLD = 100
 SAFE_PREFIX_DIV = 2
-NearestEdgeStrategy = Literal["sort", "pick-mins"]
+NearestEdgeStrategy = Literal["sort"]
 DEFAULT_NEAREST_EDGE_STRATEGY: NearestEdgeStrategy = "sort"
-VALID_NEAREST_EDGE_STRATEGIES = frozenset(("sort", "pick-mins"))
+VALID_NEAREST_EDGE_STRATEGIES = frozenset(("sort",))
 
 sys.setrecursionlimit(max(sys.getrecursionlimit(), NOTEBOOK_RECURSION_LIMIT))
 
@@ -292,11 +291,25 @@ async def _weak_comparison_alg_g_cluster_async_impl(
     coreset_assignments: dict[str, TextRow] = {}
     rounds: list[WeakComparisonAlgGRound] = []
 
+    _print_weak_comparison_stage(
+        "start",
+        rows=len(all_rows),
+        k=k,
+        round_limit=round_limit,
+        final_center_count=final_center_count,
+    )
+
     while len(active) > TERMINAL_THRESHOLD and len(rounds) < round_limit:
+        round_index = len(rounds) + 1
         n_active_before = len(active)
         ell = max(1, int(math.log2(max(n_active_before, 2))))
         delta = DEFAULT_DELTA
         cgsize = max(12, int(1.2 * ell))
+        _print_weak_comparison_stage(
+            "draw_round_samples",
+            round=round_index,
+            active=n_active_before,
+        )
         samples = _draw_round_samples(
             active,
             k=k,
@@ -311,16 +324,29 @@ async def _weak_comparison_alg_g_cluster_async_impl(
         non_sample_rows = [row for row in active if row.id not in sample_ids]
 
         x_edges = _edge_set(samples.sample1, samples.sample2)
-        pi_x = await _prob_sort_edges_async(
+        _print_weak_comparison_stage(
+            "sort_sample_edges",
+            round=round_index,
+            sample1=len(samples.sample1),
+            sample2=len(samples.sample2),
+            edges=len(x_edges),
+        )
+        pi_x = await _quick_sort_edges_async(
             x_edges,
             _DirectEdgeComparator(
                 comparator,
                 batch_size=comparison_batch_size,
             ).compare_edges_batch_async,
-            d=DEFAULT_PROB_SORT_D,
             batch_size=comparison_batch_size,
         )
         edge_sample_count = len(x_edges)
+        _print_weak_comparison_stage(
+            "build_core_structures",
+            round=round_index,
+            ordered_edges=len(pi_x),
+            window_size=cgsize,
+            dislocation_bound=delta,
+        )
         core_structures = _build_core_structures(
             ordered_x_edges=pi_x,
             sample1=samples.sample1,
@@ -328,6 +354,12 @@ async def _weak_comparison_alg_g_cluster_async_impl(
             delta=delta,
         )
 
+        _print_weak_comparison_stage(
+            "filter_candidates",
+            round=round_index,
+            candidates=len(non_sample_rows),
+            guards=len(core_structures.guards),
+        )
         v_prime = await _filter_candidates_by_guard_proximity_async(
             non_sample_rows,
             samples.sample1,
@@ -337,6 +369,13 @@ async def _weak_comparison_alg_g_cluster_async_impl(
         )
 
         y_edges = _edge_set(samples.sample1, v_prime)
+        _print_weak_comparison_stage(
+            "order_nearest_edges",
+            round=round_index,
+            filtered=len(v_prime),
+            edges=len(y_edges),
+            strategy=nearest_edge_strategy,
+        )
         alg_test = _AlgTestComparator(
             comparator=comparator,
             kernels=core_structures.kernels,
@@ -350,6 +389,11 @@ async def _weak_comparison_alg_g_cluster_async_impl(
             nearest_edge_strategy=nearest_edge_strategy,
             rng=rng,
             batch_size=comparison_batch_size,
+        )
+        _print_weak_comparison_stage(
+            "remove_safe_prefix",
+            round=round_index,
+            ordered_nearest_edges=len(ordered_nearest_edges),
         )
         safe_threshold = min(
             len(ordered_nearest_edges),
@@ -386,9 +430,14 @@ async def _weak_comparison_alg_g_cluster_async_impl(
         if len(active) >= n_active_before:
             break
 
+    _print_weak_comparison_stage("assign_terminal_rows", active=len(active))
     for row in active:
         coreset_assignments[row.id] = row
 
+    _print_weak_comparison_stage(
+        "build_coreset_clusters",
+        assignments=len(coreset_assignments),
+    )
     coreset_clusters = _build_clusters(all_rows, coreset_assignments)
     coreset_centers = tuple(cluster.center for cluster in coreset_clusters)
 
@@ -397,10 +446,20 @@ async def _weak_comparison_alg_g_cluster_async_impl(
         assignments = dict(coreset_assignments)
         clusters = coreset_clusters
     else:
+        _print_weak_comparison_stage(
+            "compress_exact_k",
+            coreset_centers=len(coreset_centers),
+            final_center_count=final_center_count,
+        )
         centers = _select_compression_centers(
             coreset_clusters,
             all_rows,
             final_center_count,
+        )
+        _print_weak_comparison_stage(
+            "assign_exact_k_centers",
+            rows=len(all_rows),
+            centers=len(centers),
         )
         nearest_centers = await _nearest_centers_async(
             all_rows,
@@ -434,15 +493,35 @@ async def _weak_comparison_alg_g_cluster_async_impl(
     )
 
 
+def _print_weak_comparison_stage(stage: str, **details: object) -> None:
+    detail_text = " ".join(
+        f"{key}={value}" for key, value in details.items() if value is not None
+    )
+    suffix = f" {detail_text}" if detail_text else ""
+    print(
+        f"[llm-cluster] weak-comparison stage={stage}{suffix}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
 @dataclass
 class _DirectEdgeComparator:
     comparator: DistanceComparator
     batch_size: int
+    _comparison_index_by_text: dict[str, int] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
 
     async def compare_edges_batch_async(
         self,
         edge_pairs: Sequence[tuple[_ComparisonEdge, _ComparisonEdge]],
     ) -> list[bool]:
+        if _has_index_batch_bool_comparator(self.comparator):
+            return await self._compare_edges_batch_by_index_async(edge_pairs)
+
         answers: list[bool] = []
         for chunk in _chunks(edge_pairs, self.batch_size):
             comparisons = [
@@ -462,6 +541,38 @@ class _DirectEdgeComparator:
             answers.extend(comparison_answers)
         return answers
 
+    async def _compare_edges_batch_by_index_async(
+        self,
+        edge_pairs: Sequence[tuple[_ComparisonEdge, _ComparisonEdge]],
+    ) -> list[bool]:
+        import numpy as np
+
+        answers: list[bool] = []
+        for chunk in _chunks(edge_pairs, self.batch_size):
+            comparison_array = np.empty((len(chunk), 4), dtype=np.int64)
+            for index, (edge1, edge2) in enumerate(chunk):
+                comparison_array[index, 0] = self._row_index(edge1.left)
+                comparison_array[index, 1] = self._row_index(edge1.right)
+                comparison_array[index, 2] = self._row_index(edge2.left)
+                comparison_array[index, 3] = self._row_index(edge2.right)
+
+            comparison_answers = await _compare_index_array_bool_async(
+                self.comparator,
+                comparison_array,
+                batch_size=self.batch_size,
+            )
+            answers.extend(bool(answer) for answer in comparison_answers)
+        return answers
+
+    def _row_index(self, row: TextRow) -> int:
+        try:
+            return self._comparison_index_by_text[row.text]
+        except KeyError:
+            index_for_text = getattr(self.comparator, "comparison_index_for_text")
+            index = int(index_for_text(row.text))
+            self._comparison_index_by_text[row.text] = index
+            return index
+
 
 @dataclass
 class _AlgTestComparator:
@@ -470,13 +581,28 @@ class _AlgTestComparator:
     core_prime: Mapping[str, Mapping[str, tuple[TextRow, ...]]]
     edge_pair_batch_size: int
     comparison_batch_size: int
+    _comparison_index_by_text: dict[str, int] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
+    _kernel_index_by_id: dict[str, tuple[int, ...]] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
+    _core_prime_index_by_id_pair: dict[tuple[str, str], tuple[int, ...]] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
 
     async def compare_edges_batch_async(
         self,
         edge_pairs: Sequence[tuple[_ComparisonEdge, _ComparisonEdge]],
     ) -> list[bool]:
         answers: list[bool] = []
-        for chunk in _chunks(edge_pairs, self.edge_pair_batch_size):
+        for chunk in self._edge_pair_chunks(edge_pairs):
             answers.extend(await self._compare_edge_pair_chunk_async(chunk))
         return answers
 
@@ -484,6 +610,9 @@ class _AlgTestComparator:
         self,
         edge_pairs: Sequence[tuple[_ComparisonEdge, _ComparisonEdge]],
     ) -> list[bool]:
+        if _has_index_batch_bool_comparator(self.comparator):
+            return await self._compare_edge_pair_chunk_by_index_async(edge_pairs)
+
         test_cases = [self._build_case(edge1, edge2) for edge1, edge2 in edge_pairs]
         comparisons: list[ComparisonInput] = []
         ranges: list[tuple[int, int]] = []
@@ -502,6 +631,130 @@ class _AlgTestComparator:
             test_case.resolve(results[start:end])
             for test_case, (start, end) in zip(test_cases, ranges)
         ]
+
+    async def _compare_edge_pair_chunk_by_index_async(
+        self,
+        edge_pairs: Sequence[tuple[_ComparisonEdge, _ComparisonEdge]],
+    ) -> list[bool]:
+        import numpy as np
+
+        answers = [True] * len(edge_pairs)
+        specs: list[tuple[int, int, int, tuple[int, ...], int, bool]] = []
+        comparison_count = 0
+
+        for pair_index, (edge1, edge2) in enumerate(edge_pairs):
+            spec = self._build_index_case_spec(edge1, edge2)
+            if spec is None:
+                continue
+
+            ab_left, ab_right, cd_left_values, cd_right, invert_majority = spec
+            if not cd_left_values:
+                continue
+
+            specs.append(
+                (
+                    pair_index,
+                    ab_left,
+                    ab_right,
+                    cd_left_values,
+                    cd_right,
+                    invert_majority,
+                )
+            )
+            comparison_count += len(cd_left_values)
+
+        if comparison_count == 0:
+            return answers
+
+        comparisons = np.empty((comparison_count, 4), dtype=np.int64)
+        ranges: list[tuple[int, int, int, bool]] = []
+        offset = 0
+        for (
+            pair_index,
+            ab_left,
+            ab_right,
+            cd_left_values,
+            cd_right,
+            invert_majority,
+        ) in specs:
+            start = offset
+            end = start + len(cd_left_values)
+            comparisons[start:end, 0] = ab_left
+            comparisons[start:end, 1] = ab_right
+            comparisons[start:end, 2] = cd_left_values
+            comparisons[start:end, 3] = cd_right
+            ranges.append((pair_index, start, end, invert_majority))
+            offset = end
+
+        results = await _compare_index_array_bool_async(
+            self.comparator,
+            comparisons,
+            batch_size=self.comparison_batch_size,
+        )
+        result_array = np.asarray(results, dtype=bool)
+        if len(result_array) != comparison_count:
+            raise RuntimeError(
+                "Indexed comparator returned an unexpected result count."
+            )
+
+        not_smaller_prefix = np.empty(comparison_count + 1, dtype=np.int64)
+        not_smaller_prefix[0] = 0
+        np.cumsum(~result_array, out=not_smaller_prefix[1:])
+        for pair_index, start, end, invert_majority in ranges:
+            answers[pair_index] = _resolve_alg_test_count(
+                not_smaller_count=int(
+                    not_smaller_prefix[end] - not_smaller_prefix[start]
+                ),
+                result_count=end - start,
+                invert_majority=invert_majority,
+            )
+
+        return answers
+
+    def _edge_pair_chunks(
+        self,
+        edge_pairs: Sequence[tuple[_ComparisonEdge, _ComparisonEdge]],
+    ) -> Iterator[list[tuple[_ComparisonEdge, _ComparisonEdge]]]:
+        chunk: list[tuple[_ComparisonEdge, _ComparisonEdge]] = []
+        comparison_count = 0
+        max_edge_pairs = max(1, self.edge_pair_batch_size)
+        max_comparisons = max(1, self.comparison_batch_size)
+
+        for edge_pair in edge_pairs:
+            pair_comparison_count = self._edge_pair_comparison_count(*edge_pair)
+            if chunk and (
+                len(chunk) >= max_edge_pairs
+                or comparison_count + pair_comparison_count > max_comparisons
+            ):
+                yield chunk
+                chunk = []
+                comparison_count = 0
+
+            chunk.append(edge_pair)
+            comparison_count += pair_comparison_count
+
+        if chunk:
+            yield chunk
+
+    def _edge_pair_comparison_count(
+        self,
+        edge1: _ComparisonEdge,
+        edge2: _ComparisonEdge,
+    ) -> int:
+        s1 = edge1.left
+        s2 = edge2.left
+        if s1.id not in self.kernels or s2.id not in self.kernels:
+            return 0
+
+        if s1.id == s2.id:
+            return len(self.kernels.get(s2.id, ()))
+
+        core2 = self.core_prime.get(s1.id, {}).get(s2.id, ())
+        if core2:
+            return len(core2)
+
+        core1 = self.core_prime.get(s2.id, {}).get(s1.id, ())
+        return len(core1)
 
     def _build_case(
         self,
@@ -547,6 +800,88 @@ class _AlgTestComparator:
 
         return _AlgTestCase(default=True)
 
+    def _build_index_case_spec(
+        self,
+        edge1: _ComparisonEdge,
+        edge2: _ComparisonEdge,
+    ) -> IndexAlgTestSpec | None:
+        s1 = edge1.left
+        s2 = edge2.left
+        v1 = edge1.right
+        v2 = edge2.right
+
+        if s1.id not in self.kernels or s2.id not in self.kernels:
+            return None
+
+        if s1.id == s2.id:
+            core2 = self._kernel_indexes(s2.id)
+            if not core2:
+                return None
+            return (
+                self._row_index(s1),
+                self._row_index(v1),
+                core2,
+                self._row_index(v2),
+                True,
+            )
+
+        core2 = self._core_prime_indexes(s1.id, s2.id)
+        if core2:
+            return (
+                self._row_index(s1),
+                self._row_index(v1),
+                core2,
+                self._row_index(v2),
+                True,
+            )
+
+        core1 = self._core_prime_indexes(s2.id, s1.id)
+        if core1:
+            return (
+                self._row_index(s2),
+                self._row_index(v2),
+                core1,
+                self._row_index(v1),
+                False,
+            )
+
+        return None
+
+    def _row_index(self, row: TextRow) -> int:
+        try:
+            return self._comparison_index_by_text[row.text]
+        except KeyError:
+            index_for_text = getattr(self.comparator, "comparison_index_for_text")
+            index = int(index_for_text(row.text))
+            self._comparison_index_by_text[row.text] = index
+            return index
+
+    def _kernel_indexes(self, row_id: str) -> tuple[int, ...]:
+        try:
+            return self._kernel_index_by_id[row_id]
+        except KeyError:
+            indexes = tuple(
+                self._row_index(row) for row in self.kernels.get(row_id, ())
+            )
+            self._kernel_index_by_id[row_id] = indexes
+            return indexes
+
+    def _core_prime_indexes(
+        self,
+        left_id: str,
+        right_id: str,
+    ) -> tuple[int, ...]:
+        key = (left_id, right_id)
+        try:
+            return self._core_prime_index_by_id_pair[key]
+        except KeyError:
+            indexes = tuple(
+                self._row_index(row)
+                for row in self.core_prime.get(left_id, {}).get(right_id, ())
+            )
+            self._core_prime_index_by_id_pair[key] = indexes
+            return indexes
+
 
 @dataclass(frozen=True)
 class _AlgTestCase:
@@ -569,181 +904,142 @@ class _AlgTestCase:
         return majority_not_smaller
 
 
-async def _prob_sort_edges_async(
-    edges: Sequence[_ComparisonEdge],
-    compare_batch_async: EdgeComparisonBatch,
+def _resolve_alg_test_results(
+    results: Sequence[bool],
     *,
-    d: int,
-    batch_size: int,
-) -> list[_ComparisonEdge]:
-    if len(edges) <= 6 * d:
-        return await _window_sort_edges_async(
-            edges,
-            compare_batch_async,
-            batch_size=batch_size,
-        )
+    start: int,
+    end: int,
+    invert_majority: bool,
+) -> bool:
+    not_smaller_count = 0
+    for index in range(start, end):
+        if not results[index]:
+            not_smaller_count += 1
 
-    mid = len(edges) // 2
-    left_sorted = await _prob_sort_edges_async(
-        edges[:mid],
-        compare_batch_async,
-        d=d,
-        batch_size=batch_size,
-    )
-    right_sorted = await _prob_sort_edges_async(
-        edges[mid:],
-        compare_batch_async,
-        d=d,
-        batch_size=batch_size,
+    return _resolve_alg_test_count(
+        not_smaller_count=not_smaller_count,
+        result_count=end - start,
+        invert_majority=invert_majority,
     )
 
-    merged: list[_ComparisonEdge] = []
-    left = deque(left_sorted)
-    right = deque(right_sorted)
-    prefix_size = 3 * d
-    while len(left) + len(right) > 6 * d:
-        window = [
-            *_deque_prefix(left, prefix_size),
-            *_deque_prefix(right, prefix_size),
-        ]
-        window_sorted = await _window_sort_edges_async(
-            window,
-            compare_batch_async,
-            batch_size=batch_size,
-        )
-        promoted = window_sorted[:d]
-        promoted_keys = {edge.key for edge in promoted}
-        merged.extend(promoted)
-        _remove_keys_from_deque_prefix(left, promoted_keys, prefix_size)
-        _remove_keys_from_deque_prefix(right, promoted_keys, prefix_size)
 
-    tail = [*left, *right]
-    merged.extend(
-        await _window_sort_edges_async(
-            tail,
-            compare_batch_async,
-            batch_size=batch_size,
-        )
-    )
-    return merged
+def _resolve_alg_test_count(
+    *,
+    not_smaller_count: int,
+    result_count: int,
+    invert_majority: bool,
+) -> bool:
+    majority_not_smaller = not_smaller_count > result_count // 2
+    if invert_majority:
+        return not majority_not_smaller
+    return majority_not_smaller
 
 
-def _deque_prefix(
-    edges: deque[_ComparisonEdge],
-    size: int,
-) -> list[_ComparisonEdge]:
-    return list(islice(edges, size))
+@dataclass
+class _FlattenedEdgeSortNode:
+    edges: list[_ComparisonEdge]
+    middle: list[_ComparisonEdge] | None = None
+    less_child: "_FlattenedEdgeSortNode | None" = None
+    greater_child: "_FlattenedEdgeSortNode | None" = None
 
 
-def _remove_keys_from_deque_prefix(
-    edges: deque[_ComparisonEdge],
-    removed_keys: set[tuple[str, str]],
-    size: int,
-) -> None:
-    if not edges or not removed_keys:
-        return
-
-    scanned = min(size, len(edges))
-    kept: list[_ComparisonEdge] = []
-    for _ in range(scanned):
-        edge = edges.popleft()
-        if edge.key not in removed_keys:
-            kept.append(edge)
-
-    edges.extendleft(reversed(kept))
+@dataclass
+class _QuickSortPartition:
+    node: _FlattenedEdgeSortNode
+    pivot: _ComparisonEdge
+    less: list[_ComparisonEdge]
+    equal: list[_ComparisonEdge]
+    greater: list[_ComparisonEdge]
 
 
-async def _window_sort_edges_async(
+@dataclass
+class _AdvSortPartition:
+    node: _FlattenedEdgeSortNode
+    pivot: _ComparisonEdge
+    less: list[_ComparisonEdge]
+    greater: list[_ComparisonEdge]
+    left_rng: random.Random
+    right_rng: random.Random
+
+
+async def _quick_sort_edges_async(
     edges: Sequence[_ComparisonEdge],
     compare_batch_async: EdgeComparisonBatch,
     *,
     batch_size: int,
 ) -> list[_ComparisonEdge]:
-    return await _window_quick_sort_edges_async(
-        edges,
-        compare_batch_async,
-        batch_size=batch_size,
-    )
+    root = _FlattenedEdgeSortNode(list(edges))
+    active = [root]
+    height = 0
 
+    while active:
+        _print_sort_level(
+            "quick_sort_edges",
+            height,
+            [len(node.edges) for node in active],
+        )
+        partitions: list[_QuickSortPartition] = []
+        forward_pairs: list[tuple[_ComparisonEdge, _ComparisonEdge]] = []
+        forward_meta: list[tuple[_QuickSortPartition, _ComparisonEdge]] = []
 
-async def _window_quick_sort_edges_async(
-    edges: Sequence[_ComparisonEdge],
-    compare_batch_async: EdgeComparisonBatch,
-    *,
-    batch_size: int,
-) -> list[_ComparisonEdge]:
-    if len(edges) <= 1:
-        return list(edges)
+        for node in active:
+            if len(node.edges) <= 1:
+                continue
 
-    pivot = edges[0]
-    less: list[_ComparisonEdge] = []
-    equal: list[_ComparisonEdge] = [pivot]
-    greater: list[_ComparisonEdge] = []
-
-    partition_chunk: list[_ComparisonEdge] = []
-    for edge in edges[1:]:
-        partition_chunk.append(edge)
-        if len(partition_chunk) >= batch_size:
-            await _partition_window_against_pivot_async(
-                partition_chunk,
-                pivot,
-                compare_batch_async,
-                less,
-                equal,
-                greater,
+            pivot = node.edges[0]
+            partition = _QuickSortPartition(
+                node=node,
+                pivot=pivot,
+                less=[],
+                equal=[pivot],
+                greater=[],
             )
-            partition_chunk.clear()
+            partitions.append(partition)
+            for edge in node.edges[1:]:
+                forward_pairs.append((edge, pivot))
+                forward_meta.append((partition, edge))
 
-    if partition_chunk:
-        await _partition_window_against_pivot_async(
-            partition_chunk,
-            pivot,
+        if not partitions:
+            break
+
+        forward_results = await _compare_edge_pairs_in_batches_async(
+            forward_pairs,
             compare_batch_async,
-            less,
-            equal,
-            greater,
+            batch_size=batch_size,
         )
+        reverse_pairs: list[tuple[_ComparisonEdge, _ComparisonEdge]] = []
+        reverse_meta: list[tuple[_QuickSortPartition, _ComparisonEdge]] = []
+        for (partition, edge), edge_is_less in zip(forward_meta, forward_results):
+            if edge_is_less:
+                partition.less.append(edge)
+            else:
+                reverse_pairs.append((partition.pivot, edge))
+                reverse_meta.append((partition, edge))
 
-    less_sorted = await _window_quick_sort_edges_async(
-        less,
-        compare_batch_async,
-        batch_size=batch_size,
-    )
-    greater_sorted = await _window_quick_sort_edges_async(
-        greater,
-        compare_batch_async,
-        batch_size=batch_size,
-    )
-    return [*less_sorted, *equal, *greater_sorted]
+        reverse_results = await _compare_edge_pairs_in_batches_async(
+            reverse_pairs,
+            compare_batch_async,
+            batch_size=batch_size,
+        )
+        for (partition, edge), pivot_is_less in zip(reverse_meta, reverse_results):
+            if pivot_is_less:
+                partition.greater.append(edge)
+            else:
+                partition.equal.append(edge)
 
+        next_active: list[_FlattenedEdgeSortNode] = []
+        for partition in partitions:
+            less_child = _FlattenedEdgeSortNode(partition.less)
+            greater_child = _FlattenedEdgeSortNode(partition.greater)
+            partition.node.middle = partition.equal
+            partition.node.less_child = less_child
+            partition.node.greater_child = greater_child
+            partition.node.edges = []
+            next_active.extend((less_child, greater_child))
+        active = next_active
+        height += 1
 
-async def _partition_window_against_pivot_async(
-    edges: Sequence[_ComparisonEdge],
-    pivot: _ComparisonEdge,
-    compare_batch_async: EdgeComparisonBatch,
-    less: list[_ComparisonEdge],
-    equal: list[_ComparisonEdge],
-    greater: list[_ComparisonEdge],
-) -> None:
-    forward_results = await compare_batch_async([(edge, pivot) for edge in edges])
-    unresolved_edges = [
-        edge for edge, edge_is_less in zip(edges, forward_results) if not edge_is_less
-    ]
-    reverse_results = await compare_batch_async(
-        [(pivot, edge) for edge in unresolved_edges]
-    )
-
-    reverse_by_key = {
-        edge.key: pivot_is_less
-        for edge, pivot_is_less in zip(unresolved_edges, reverse_results)
-    }
-    for edge, edge_is_less in zip(edges, forward_results):
-        if edge_is_less:
-            less.append(edge)
-        elif reverse_by_key.get(edge.key, False):
-            greater.append(edge)
-        else:
-            equal.append(edge)
+    return _flatten_edge_sort_tree(root)
 
 
 async def _adv_sort_edges_async(
@@ -753,53 +1049,128 @@ async def _adv_sort_edges_async(
     *,
     batch_size: int,
 ) -> list[_ComparisonEdge]:
-    if len(edges) <= 1:
-        return list(edges)
+    root = _FlattenedEdgeSortNode(list(edges))
+    active: list[tuple[_FlattenedEdgeSortNode, random.Random]] = [(root, rng)]
+    height = 0
 
-    pivot_index = rng.randrange(len(edges))
-    pivot = edges[pivot_index]
-    less: list[_ComparisonEdge] = []
-    greater: list[_ComparisonEdge] = []
+    while active:
+        _print_sort_level(
+            "adv_sort_edges",
+            height,
+            [len(node.edges) for node, _ in active],
+        )
+        partitions: list[_AdvSortPartition] = []
+        edge_pairs: list[tuple[_ComparisonEdge, _ComparisonEdge]] = []
+        pair_meta: list[tuple[_AdvSortPartition, _ComparisonEdge]] = []
 
-    partition_chunk: list[_ComparisonEdge] = []
-    for index, edge in enumerate(edges):
-        if index == pivot_index:
+        for node, node_rng in active:
+            if len(node.edges) <= 1:
+                continue
+
+            pivot_index = node_rng.randrange(len(node.edges))
+            pivot = node.edges[pivot_index]
+            left_rng, right_rng = _branch_rngs(node_rng)
+            partition = _AdvSortPartition(
+                node=node,
+                pivot=pivot,
+                less=[],
+                greater=[],
+                left_rng=left_rng,
+                right_rng=right_rng,
+            )
+            partitions.append(partition)
+
+            for index, edge in enumerate(node.edges):
+                if index == pivot_index:
+                    continue
+                edge_pairs.append((edge, pivot))
+                pair_meta.append((partition, edge))
+
+        if not partitions:
+            break
+
+        edge_is_less = await _compare_edge_pairs_in_batches_async(
+            edge_pairs,
+            compare_batch_async,
+            batch_size=batch_size,
+        )
+        for (partition, edge), is_less in zip(pair_meta, edge_is_less):
+            if is_less:
+                partition.less.append(edge)
+            else:
+                partition.greater.append(edge)
+
+        next_active: list[tuple[_FlattenedEdgeSortNode, random.Random]] = []
+        for partition in partitions:
+            less_child = _FlattenedEdgeSortNode(partition.less)
+            greater_child = _FlattenedEdgeSortNode(partition.greater)
+            partition.node.middle = [partition.pivot]
+            partition.node.less_child = less_child
+            partition.node.greater_child = greater_child
+            partition.node.edges = []
+            next_active.extend(
+                (
+                    (less_child, partition.left_rng),
+                    (greater_child, partition.right_rng),
+                )
+            )
+        active = next_active
+        height += 1
+
+    return _flatten_edge_sort_tree(root)
+
+
+def _print_sort_level(
+    stage: str,
+    height: int,
+    sizes: Sequence[int],
+) -> None:
+    _print_weak_comparison_stage(
+        stage,
+        height=height,
+        partitions=len(sizes),
+        active_edges=sum(sizes),
+        max_size=max(sizes, default=0),
+    )
+
+
+async def _compare_edge_pairs_in_batches_async(
+    edge_pairs: Sequence[tuple[_ComparisonEdge, _ComparisonEdge]],
+    compare_batch_async: EdgeComparisonBatch,
+    *,
+    batch_size: int,
+) -> list[bool]:
+    if not edge_pairs:
+        return []
+
+    answers: list[bool] = []
+    for chunk in _chunks(edge_pairs, batch_size):
+        answers.extend(await compare_batch_async(chunk))
+    return answers
+
+
+def _flatten_edge_sort_tree(root: _FlattenedEdgeSortNode) -> list[_ComparisonEdge]:
+    sorted_edges: list[_ComparisonEdge] = []
+    stack: list[_FlattenedEdgeSortNode | list[_ComparisonEdge]] = [root]
+
+    while stack:
+        item = stack.pop()
+        if isinstance(item, list):
+            sorted_edges.extend(item)
             continue
 
-        partition_chunk.append(edge)
-        if len(partition_chunk) >= batch_size:
-            await _partition_against_pivot_async(
-                partition_chunk,
-                pivot,
-                compare_batch_async,
-                less,
-                greater,
-            )
-            partition_chunk.clear()
+        node = item
+        if node.middle is None:
+            sorted_edges.extend(node.edges)
+            continue
 
-    if partition_chunk:
-        await _partition_against_pivot_async(
-            partition_chunk,
-            pivot,
-            compare_batch_async,
-            less,
-            greater,
-        )
+        if node.greater_child is not None:
+            stack.append(node.greater_child)
+        stack.append(node.middle)
+        if node.less_child is not None:
+            stack.append(node.less_child)
 
-    left_rng, right_rng = _branch_rngs(rng)
-    less_sorted = await _adv_sort_edges_async(
-        less,
-        compare_batch_async,
-        left_rng,
-        batch_size=batch_size,
-    )
-    greater_sorted = await _adv_sort_edges_async(
-        greater,
-        compare_batch_async,
-        right_rng,
-        batch_size=batch_size,
-    )
-    return [*less_sorted, pivot, *greater_sorted]
+    return sorted_edges
 
 
 async def _ordered_nearest_edges_async(
@@ -810,97 +1181,19 @@ async def _ordered_nearest_edges_async(
     rng: random.Random,
     batch_size: int,
 ) -> list[_ComparisonEdge]:
-    if nearest_edge_strategy == "sort":
-        ordered_edges = await _adv_sort_edges_async(
-            edges,
-            compare_batch_async,
-            rng,
-            batch_size=batch_size,
-        )
-        nearest_edges = _first_edges_by_right_vertex(ordered_edges)
-        return [
-            edge for edge in ordered_edges if nearest_edges.get(edge.right.id) == edge
-        ]
+    if nearest_edge_strategy not in VALID_NEAREST_EDGE_STRATEGIES:
+        raise ValueError(f"Unknown nearest_edge_strategy: {nearest_edge_strategy!r}.")
 
-    if nearest_edge_strategy == "pick-mins":
-        nearest_edges = await _pick_min_edges_by_right_vertex_async(
-            edges,
-            compare_batch_async,
-        )
-        return await _adv_sort_edges_async(
-            nearest_edges,
-            compare_batch_async,
-            rng,
-            batch_size=batch_size,
-        )
-
-    raise ValueError(f"Unknown nearest_edge_strategy: {nearest_edge_strategy!r}.")
-
-
-async def _pick_min_edges_by_right_vertex_async(
-    edges: Sequence[_ComparisonEdge],
-    compare_batch_async: EdgeComparisonBatch,
-) -> list[_ComparisonEdge]:
-    active_groups = _edges_grouped_by_right_vertex(edges)
-    if not active_groups:
-        return []
-
-    while any(len(group) > 1 for group in active_groups):
-        next_groups: list[list[_ComparisonEdge]] = [[] for _ in active_groups]
-        comparisons: list[tuple[_ComparisonEdge, _ComparisonEdge]] = []
-        comparison_groups: list[int] = []
-
-        for group_index, group in enumerate(active_groups):
-            for edge_index in range(0, len(group) - 1, 2):
-                comparisons.append((group[edge_index], group[edge_index + 1]))
-                comparison_groups.append(group_index)
-            if len(group) % 2:
-                next_groups[group_index].append(group[-1])
-
-        if not comparisons:
-            break
-
-        results = await compare_batch_async(comparisons)
-        for group_index, (left, right), is_left_less in zip(
-            comparison_groups,
-            comparisons,
-            results,
-        ):
-            next_groups[group_index].append(left if is_left_less else right)
-
-        active_groups = next_groups
-
-    return [group[0] for group in active_groups if group]
-
-
-def _edges_grouped_by_right_vertex(
-    edges: Sequence[_ComparisonEdge],
-) -> list[list[_ComparisonEdge]]:
-    groups_by_right_id: dict[str, list[_ComparisonEdge]] = {}
-    ordered_right_ids: list[str] = []
-    for edge in edges:
-        if edge.right.id not in groups_by_right_id:
-            groups_by_right_id[edge.right.id] = []
-            ordered_right_ids.append(edge.right.id)
-        groups_by_right_id[edge.right.id].append(edge)
-
-    return [groups_by_right_id[right_id] for right_id in ordered_right_ids]
-
-
-async def _partition_against_pivot_async(
-    edges: Sequence[_ComparisonEdge],
-    pivot: _ComparisonEdge,
-    compare_batch_async: EdgeComparisonBatch,
-    less: list[_ComparisonEdge],
-    greater: list[_ComparisonEdge],
-) -> None:
-    comparisons = [(edge, pivot) for edge in edges]
-    edge_is_less = await compare_batch_async(comparisons)
-    for edge, is_less in zip(edges, edge_is_less):
-        if is_less:
-            less.append(edge)
-        else:
-            greater.append(edge)
+    ordered_edges = await _adv_sort_edges_async(
+        edges,
+        compare_batch_async,
+        rng,
+        batch_size=batch_size,
+    )
+    nearest_edges = _first_edges_by_right_vertex(ordered_edges)
+    return [
+        edge for edge in ordered_edges if nearest_edges.get(edge.right.id) == edge
+    ]
 
 
 def _build_core_structures(
@@ -1001,6 +1294,32 @@ async def _filter_candidates_by_guard_proximity_async(
     if not candidates:
         return []
 
+    if getattr(comparator, "prefer_guard_proximity_counts", False):
+        if _has_index_batch_bool_comparator(comparator):
+            return await _filter_candidates_by_flattened_guard_index_comparisons_async(
+                candidates,
+                sample1,
+                guards,
+                comparator,
+                batch_size=batch_size,
+            )
+        if _has_batch_bool_comparator(comparator):
+            return await _filter_candidates_by_flattened_guard_comparisons_async(
+                candidates,
+                sample1,
+                guards,
+                comparator,
+                batch_size=batch_size,
+            )
+        fast_result = await _filter_candidates_by_preferred_guard_counts_async(
+            candidates,
+            sample1,
+            guards,
+            comparator,
+        )
+        if fast_result is not None:
+            return fast_result
+
     edge_distance_matrix = _edge_distance_matrix_callback(comparator)
     if edge_distance_matrix is not None:
         return _filter_candidates_by_guard_proximity_matrix(
@@ -1032,44 +1351,324 @@ async def _filter_candidates_by_guard_proximity_async(
             guard_proximity_counts,
         )
 
-    prox_max = {row.id: 0 for row in candidates}
-    for sample in sample1:
-        guard_rows = guards.get(sample.id, ())
-        if not guard_rows:
-            continue
+    if _has_index_batch_bool_comparator(comparator):
+        return await _filter_candidates_by_flattened_guard_index_comparisons_async(
+            candidates,
+            sample1,
+            guards,
+            comparator,
+            batch_size=batch_size,
+        )
 
-        counts = {row.id: 0 for row in candidates}
-        comparisons: list[ComparisonInput] = []
-        compared_row_ids: list[str] = []
-        for row in candidates:
+    return await _filter_candidates_by_flattened_guard_comparisons_async(
+        candidates,
+        sample1,
+        guards,
+        comparator,
+        batch_size=batch_size,
+    )
+
+
+def _has_batch_bool_comparator(comparator: DistanceComparator) -> bool:
+    return callable(getattr(comparator, "compare_batch_bool_async", None)) or callable(
+        getattr(comparator, "compare_batch_bool", None)
+    )
+
+
+def _has_index_batch_bool_comparator(comparator: DistanceComparator) -> bool:
+    return callable(getattr(comparator, "comparison_index_for_text", None)) and (
+        callable(getattr(comparator, "compare_index_array_bool_async", None))
+        or callable(getattr(comparator, "compare_index_array_bool", None))
+        or callable(getattr(comparator, "compare_index_batch_bool_async", None))
+        or callable(getattr(comparator, "compare_index_batch_bool", None))
+    )
+
+
+def _index_array_to_comparison_list(comparisons: Any) -> list[IndexComparisonInput]:
+    return [
+        (int(row[0]), int(row[1]), int(row[2]), int(row[3]))
+        for row in comparisons
+    ]
+
+
+async def _compare_index_array_bool_async(
+    comparator: DistanceComparator,
+    comparisons: Any,
+    *,
+    batch_size: int = DEFAULT_ORACLE_COMPARISON_BATCH_SIZE,
+) -> Any:
+    if len(comparisons) == 0:
+        return []
+    if len(comparisons) > batch_size:
+        import numpy as np
+
+        answer_chunks = []
+        for chunk in _chunks(comparisons, batch_size):
+            answer_chunks.append(
+                await _compare_index_array_bool_raw_async(comparator, chunk)
+            )
+        return np.concatenate(
+            [np.asarray(chunk, dtype=bool) for chunk in answer_chunks],
+        )
+
+    return await _compare_index_array_bool_raw_async(comparator, comparisons)
+
+
+async def _compare_index_array_bool_raw_async(
+    comparator: DistanceComparator,
+    comparisons: Any,
+) -> Any:
+    if len(comparisons) == 0:
+        return []
+
+    compare_index_array_bool_async = getattr(
+        comparator,
+        "compare_index_array_bool_async",
+        None,
+    )
+    if compare_index_array_bool_async is not None:
+        return await compare_index_array_bool_async(comparisons)
+
+    compare_index_array_bool = getattr(comparator, "compare_index_array_bool", None)
+    if compare_index_array_bool is not None:
+        return compare_index_array_bool(comparisons)
+
+    comparison_list = _index_array_to_comparison_list(comparisons)
+    compare_index_batch_bool_async = getattr(
+        comparator,
+        "compare_index_batch_bool_async",
+        None,
+    )
+    if compare_index_batch_bool_async is not None:
+        return await compare_index_batch_bool_async(comparison_list)
+
+    compare_index_batch_bool = getattr(comparator, "compare_index_batch_bool", None)
+    if compare_index_batch_bool is not None:
+        return compare_index_batch_bool(comparison_list)
+
+    raise RuntimeError("Comparator does not support indexed batch comparisons.")
+
+
+async def _filter_candidates_by_flattened_guard_index_comparisons_async(
+    candidates: Sequence[TextRow],
+    sample1: Sequence[TextRow],
+    guards: Mapping[str, tuple[TextRow, ...]],
+    comparator: DistanceComparator,
+    *,
+    batch_size: int,
+) -> list[TextRow]:
+    import numpy as np
+
+    candidate_ids = tuple(row.id for row in candidates)
+    active_samples = tuple(
+        (sample, guards.get(sample.id, ()))
+        for sample in sample1
+        if guards.get(sample.id)
+    )
+    if not active_samples:
+        return _filter_candidates_by_proximity(
+            candidates,
+            {row_id: 0 for row_id in candidate_ids},
+        )
+
+    index_by_text: dict[str, int] = {}
+    index_for_text = getattr(comparator, "comparison_index_for_text")
+
+    def row_index(row: TextRow) -> int:
+        try:
+            return index_by_text[row.text]
+        except KeyError:
+            index = int(index_for_text(row.text))
+            index_by_text[row.text] = index
+            return index
+
+    candidate_index_values = np.fromiter(
+        (row_index(candidate) for candidate in candidates),
+        dtype=np.int64,
+        count=len(candidates),
+    )
+    indexed_active_samples = tuple(
+        (
+            sample_index,
+            row_index(sample),
+            np.fromiter(
+                (row_index(guard) for guard in guard_rows),
+                dtype=np.int64,
+                count=len(guard_rows),
+            ),
+        )
+        for sample_index, (sample, guard_rows) in enumerate(active_samples)
+    )
+    counts = np.zeros((len(active_samples), len(candidates)), dtype=np.int32)
+    max_batch_size = max(1, batch_size)
+    comparisons = np.empty((max_batch_size, 4), dtype=np.int64)
+    comparison_sample_indexes = np.empty(max_batch_size, dtype=np.intp)
+    comparison_candidate_indexes = np.empty(max_batch_size, dtype=np.intp)
+    comparison_count = 0
+
+    async def flush() -> None:
+        nonlocal comparison_count
+
+        if comparison_count == 0:
+            return
+
+        answers = await _compare_index_array_bool_async(
+            comparator,
+            comparisons[:comparison_count],
+            batch_size=batch_size,
+        )
+        answer_array = np.asarray(answers, dtype=bool)
+        if len(answer_array) != comparison_count:
+            raise RuntimeError(
+                "Indexed comparator returned an unexpected result count."
+            )
+
+        if np.any(answer_array):
+            np.add.at(
+                counts,
+                (
+                    comparison_sample_indexes[:comparison_count][answer_array],
+                    comparison_candidate_indexes[:comparison_count][answer_array],
+                ),
+                1,
+            )
+
+        comparison_count = 0
+
+    for sample_index, sample_index_value, guard_index_values in indexed_active_samples:
+        for candidate_index, candidate_index_value in enumerate(candidate_index_values):
+            guard_offset = 0
+            while guard_offset < len(guard_index_values):
+                remaining_capacity = max_batch_size - comparison_count
+                if remaining_capacity == 0:
+                    await flush()
+                    remaining_capacity = max_batch_size
+
+                copy_count = min(
+                    remaining_capacity,
+                    len(guard_index_values) - guard_offset,
+                )
+                target = slice(comparison_count, comparison_count + copy_count)
+                source = slice(guard_offset, guard_offset + copy_count)
+                comparisons[target, 0] = sample_index_value
+                comparisons[target, 1] = int(candidate_index_value)
+                comparisons[target, 2] = sample_index_value
+                comparisons[target, 3] = guard_index_values[source]
+                comparison_sample_indexes[target] = sample_index
+                comparison_candidate_indexes[target] = candidate_index
+                comparison_count += copy_count
+                guard_offset += copy_count
+
+    await flush()
+    prox_max = counts.max(axis=0)
+    return _filter_candidates_by_proximity(
+        candidates,
+        {
+            row_id: int(count)
+            for row_id, count in zip(candidate_ids, prox_max)
+        },
+    )
+
+
+async def _filter_candidates_by_flattened_guard_comparisons_async(
+    candidates: Sequence[TextRow],
+    sample1: Sequence[TextRow],
+    guards: Mapping[str, tuple[TextRow, ...]],
+    comparator: DistanceComparator,
+    *,
+    batch_size: int,
+) -> list[TextRow]:
+    import numpy as np
+
+    candidate_ids = tuple(row.id for row in candidates)
+    active_samples = tuple(
+        (sample, guards.get(sample.id, ()))
+        for sample in sample1
+        if guards.get(sample.id)
+    )
+    if not active_samples:
+        return _filter_candidates_by_proximity(
+            candidates,
+            {row_id: 0 for row_id in candidate_ids},
+        )
+
+    counts = np.zeros((len(active_samples), len(candidates)), dtype=np.int32)
+    comparisons: list[ComparisonInput] = []
+    comparison_sample_indexes: list[int] = []
+    comparison_candidate_indexes: list[int] = []
+
+    async def flush() -> None:
+        if not comparisons:
+            return
+
+        answers = await _compare_batch_bool_async(
+            comparator,
+            comparisons,
+            batch_size=batch_size,
+        )
+        for sample_index, candidate_index, answer in zip(
+            comparison_sample_indexes,
+            comparison_candidate_indexes,
+            answers,
+        ):
+            if answer:
+                counts[sample_index, candidate_index] += 1
+
+        comparisons.clear()
+        comparison_sample_indexes.clear()
+        comparison_candidate_indexes.clear()
+
+    for sample_index, (sample, guard_rows) in enumerate(active_samples):
+        for candidate_index, candidate in enumerate(candidates):
             for guard in guard_rows:
                 comparisons.append(
-                    (sample.text, row.text, sample.text, guard.text)
+                    (sample.text, candidate.text, sample.text, guard.text)
                 )
-                compared_row_ids.append(row.id)
+                comparison_sample_indexes.append(sample_index)
+                comparison_candidate_indexes.append(candidate_index)
                 if len(comparisons) >= batch_size:
-                    await _add_proximity_counts_async(
-                        comparator,
-                        comparisons,
-                        compared_row_ids,
-                        counts,
-                        batch_size=batch_size,
-                    )
-                    comparisons.clear()
-                    compared_row_ids.clear()
+                    await flush()
 
-        if comparisons:
-            await _add_proximity_counts_async(
-                comparator,
-                comparisons,
-                compared_row_ids,
-                counts,
-                batch_size=batch_size,
-            )
-        for row_id, count in counts.items():
-            prox_max[row_id] = max(prox_max[row_id], count)
+    await flush()
+    prox_max = counts.max(axis=0)
+    return _filter_candidates_by_proximity(
+        candidates,
+        {
+            row_id: int(count)
+            for row_id, count in zip(candidate_ids, prox_max)
+        },
+    )
 
-    return _filter_candidates_by_proximity(candidates, prox_max)
+
+async def _filter_candidates_by_preferred_guard_counts_async(
+    candidates: Sequence[TextRow],
+    sample1: Sequence[TextRow],
+    guards: Mapping[str, tuple[TextRow, ...]],
+    comparator: DistanceComparator,
+) -> list[TextRow] | None:
+    guard_proximity_counts_async = getattr(
+        comparator,
+        "guard_proximity_counts_async",
+        None,
+    )
+    if callable(guard_proximity_counts_async):
+        return await _filter_candidates_by_guard_proximity_fast_async(
+            candidates,
+            sample1,
+            guards,
+            guard_proximity_counts_async,
+        )
+
+    guard_proximity_counts = getattr(comparator, "guard_proximity_counts", None)
+    if callable(guard_proximity_counts):
+        return _filter_candidates_by_guard_proximity_fast(
+            candidates,
+            sample1,
+            guards,
+            guard_proximity_counts,
+        )
+
+    return None
 
 
 def _filter_candidates_by_guard_proximity_matrix(
@@ -1216,24 +1815,6 @@ def _filter_candidates_by_proximity(
     )
     cutoff = int(len(sorted_candidates) * 0.75)
     return sorted_candidates[:cutoff]
-
-
-async def _add_proximity_counts_async(
-    comparator: DistanceComparator,
-    comparisons: list[ComparisonInput],
-    compared_row_ids: list[str],
-    counts: dict[str, int],
-    *,
-    batch_size: int,
-) -> None:
-    results = await _compare_batch_async(
-        comparator,
-        comparisons,
-        batch_size=batch_size,
-    )
-    for row_id, result in zip(compared_row_ids, results):
-        if result.is_ab_less_than_cd:
-            counts[row_id] += 1
 
 
 def _edge_set(

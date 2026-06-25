@@ -141,13 +141,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument(
         "--weak-comparison-nearest-edge-strategy",
-        choices=("sort", "pick-mins"),
+        choices=("sort",),
         default=DEFAULT_NEAREST_EDGE_STRATEGY,
         help=(
             "How Alg-G chooses S1-nearest edges for filtered rows. "
-            "'sort' preserves the notebook behavior by sorting all S1 x V' "
-            "edges; 'pick-mins' first picks the minimum S1 edge per row and "
-            "then sorts only those minima for the safe prefix."
+            "'sort' preserves the notebook behavior by sorting all S1 x V' edges."
         ),
     )
     parser.add_argument(
@@ -193,6 +191,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--embedding-device",
         default=None,
         help="Optional torch device for the embedding model, such as cuda or cpu.",
+    )
+    parser.add_argument(
+        "--comparison-device",
+        default=None,
+        help=(
+            "Optional torch device for embedding distance comparisons. "
+            "Defaults to --embedding-device when set, otherwise cpu. "
+            "Use auto to select cuda when available."
+        ),
     )
     parser.add_argument(
         "--no-embedding-normalize",
@@ -434,9 +441,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             batch_size=args.embedding_batch_size,
             normalize_embeddings=args.embedding_normalize,
             device=args.embedding_device,
+            comparison_device=args.comparison_device,
             show_progress_bar=args.embedding_progress,
             progress_callback=progress,
         )
+        if args.progress_interval > 0:
+            print(
+                "[llm-cluster] "
+                f"comparison_device={comparator.resolved_comparison_device} "
+                f"comparison_backend={comparator.comparison_backend} "
+                f"unique_comparison_texts={comparator.n_unique_texts:,} "
+                f"embedding_shape={comparator.embedding_shape}",
+                file=sys.stderr,
+                flush=True,
+            )
 
         if args.task == "rank":
             if anchor is None:
@@ -687,6 +705,7 @@ def _embedding_comparison_output(
         "batch_size": comparator.batch_size,
         "normalize_embeddings": comparator.normalize_embeddings,
         "device": comparator.device,
+        "comparison_device": comparator.resolved_comparison_device,
         "embedding_shape": list(comparator.embedding_shape),
     }
 
